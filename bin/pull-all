@@ -1,0 +1,192 @@
+#!/usr/bin/env zsh
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "$BASEDIR")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+echo "Load environment variables ..."
+if [ -f "$ROOT/.env" ]; then
+    echo "Loading environment variables from $ROOT/.env ..."
+    set -a
+    source "$ROOT/.env"
+    set +a
+fi
+
+WORKDIR="$PWD"
+if ! GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "!!! Not inside a git repository: $WORKDIR !!!"
+    exit 1
+fi
+
+echo "=== pull-all in $GIT_ROOT ==="
+
+submodules=()
+sub_names=()
+
+# Collect submodule paths and their .gitmodules section names (NUL-safe)
+collect_submodules() {
+    submodules=()
+    sub_names=()
+    [ -f "$GIT_ROOT/.gitmodules" ] || return 0
+    local entry key
+    while IFS= read -r -d $'\0' entry; do
+        key="${entry%%$'\n'*}"
+        submodules+=("${entry#*$'\n'}")
+        sub_names+=("${${key#submodule.}%.path}")
+    done < <(git -C "$GIT_ROOT" config -z --file .gitmodules --get-regexp '^submodule\..*\.path$')
+}
+
+# Initialize submodules that are not initialized yet (including nested ones)
+init_missing_submodules() {
+    local i status_line initialized_any=0
+    for (( i = 1; i <= ${#submodules[@]}; i++ )); do
+        status_line=$(git -C "$GIT_ROOT" submodule status -- "${submodules[$i]}" 2>/dev/null)
+        case "$status_line" in
+            -*)
+                echo "  init: ${submodules[$i]}"
+                git -C "$GIT_ROOT" submodule update --init --recursive -- "${submodules[$i]}" || return 1
+                initialized_any=1
+                ;;
+            *)
+                # already initialized: initialize its nested submodules as well
+                if [ -e "$GIT_ROOT/${submodules[$i]}/.git" ] && \
+                   git -C "$GIT_ROOT/${submodules[$i]}" submodule status 2>/dev/null | grep -q '^-'; then
+                    echo "  init nested submodules of: ${submodules[$i]}"
+                    git -C "$GIT_ROOT/${submodules[$i]}" submodule update --init --recursive || return 1
+                    initialized_any=1
+                fi
+                ;;
+        esac
+    done
+    if [ "$initialized_any" -eq 0 ]; then
+        echo "  no uninitialized submodule"
+    fi
+    return 0
+}
+
+# Collect repos with uncommitted changes (never stashed, only reported)
+collect_dirty() {
+    local i
+    dirty_repos=()
+    if [ -n "$(git -C "$GIT_ROOT" status --porcelain --ignore-submodules=all 2>/dev/null)" ]; then
+        dirty_repos+=("$GIT_ROOT")
+    fi
+    for (( i = 1; i <= ${#submodules[@]}; i++ )); do
+        [ -e "$GIT_ROOT/${submodules[$i]}/.git" ] || continue
+        if [ -n "$(git -C "$GIT_ROOT/${submodules[$i]}" status --porcelain 2>/dev/null)" ]; then
+            dirty_repos+=("$GIT_ROOT/${submodules[$i]}")
+        fi
+    done
+}
+
+# Report submodules whose HEAD does not match the commit recorded in the superproject
+check_consistency() {
+    local i sub recorded head
+    inconsistent=()
+    for (( i = 1; i <= ${#submodules[@]}; i++ )); do
+        sub="${submodules[$i]}"
+        [ -e "$GIT_ROOT/$sub/.git" ] || continue
+        if [ -n "$(git -C "$GIT_ROOT/$sub" status --porcelain 2>/dev/null)" ]; then
+            inconsistent+=("$sub (uncommitted changes inside submodule)")
+            continue
+        fi
+        recorded=$(git -C "$GIT_ROOT" rev-parse --verify -q ":$sub" 2>/dev/null)
+        head=$(git -C "$GIT_ROOT/$sub" rev-parse --verify -q HEAD 2>/dev/null)
+        if [ -n "$recorded" ] && [ -n "$head" ] && [ "$head" != "$recorded" ]; then
+            inconsistent+=("$sub (HEAD $head != recorded $recorded)")
+        fi
+    done
+    if [ ${#inconsistent[@]} -gt 0 ]; then
+        echo ""
+        echo "!!! Pull done, but submodules are not in sync with the recorded commits !!!"
+        for c in "${inconsistent[@]}"; do
+            echo "  $c"
+        done
+        echo "The pointer commit is not updated in $GIT_ROOT (use push-all to record it)."
+        exit 1
+    fi
+    echo "  all submodules in sync with the recorded commits"
+}
+
+collect_submodules
+
+if [ ${#submodules[@]} -gt 0 ]; then
+    echo ""
+    echo "--- submodules init check ---"
+    init_missing_submodules || { echo "!!! Failed to initialize submodules !!!"; exit 1; }
+fi
+
+collect_dirty
+if [ ${#dirty_repos[@]} -gt 0 ]; then
+    echo ""
+    echo "!!! Aborted: uncommitted changes found (no stash) !!!"
+    for d in "${dirty_repos[@]}"; do
+        echo "  dirty: $d"
+    done
+    echo "Commit or discard them first, then re-run pull-all."
+    exit 1
+fi
+
+# Pull the workdir repo itself first: the recorded submodule pointers must be
+# up to date before submodule worktrees are moved
+echo ""
+echo "--- workdir: $GIT_ROOT ---"
+cd "$GIT_ROOT" || { echo "!!! Cannot enter $GIT_ROOT !!!"; exit 1; }
+git pull || { echo "!!! git pull failed in $GIT_ROOT !!!"; exit 1; }
+
+# Root pull may change submodule urls; keep .git/config in sync (non fatal)
+git submodule sync --recursive >/dev/null 2>&1 || echo "  !!! git submodule sync failed, continue anyway !!!"
+
+# Root pull may add or remove submodules; refresh the list and init the new ones
+collect_submodules
+if [ ${#submodules[@]} -gt 0 ]; then
+    echo ""
+    echo "--- submodules init check (after pull) ---"
+    init_missing_submodules || { echo "!!! Failed to initialize submodules !!!"; exit 1; }
+fi
+
+# Pull submodules
+for (( i = 1; i <= ${#submodules[@]}; i++ )); do
+    sub="${submodules[$i]}"
+    echo ""
+    echo "--- submodule: $sub ---"
+    cd "$GIT_ROOT/$sub" || { echo "!!! Cannot enter $GIT_ROOT/$sub !!!"; exit 1; }
+
+    pull_args=()
+    if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
+        # Freshly initialized submodules are on a detached HEAD
+        branch=$(git -C "$GIT_ROOT" config --file .gitmodules --get "submodule.${sub_names[$i]}.branch" 2>/dev/null)
+        [ "$branch" = "." ] && branch=$(git -C "$GIT_ROOT" symbolic-ref --short -q HEAD 2>/dev/null)
+        [ -z "$branch" ] && branch=$(git -C "$GIT_ROOT" symbolic-ref --short -q HEAD 2>/dev/null)
+        if [ -z "$branch" ]; then
+            echo "  Detached HEAD and no branch configured, pull skipped."
+            continue
+        fi
+        if ! git rev-parse --verify -q "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+            echo "  Detached HEAD but origin/$branch not found, pull skipped."
+            continue
+        fi
+        if ! git merge-base --is-ancestor HEAD "origin/$branch" 2>/dev/null; then
+            echo "  Detached HEAD at a commit not on origin/$branch, pull skipped."
+            continue
+        fi
+        echo "  Detached HEAD, checking out $branch ..."
+        if git show-ref --verify -q "refs/heads/$branch"; then
+            git checkout "$branch" || { echo "!!! git checkout $branch failed in $PWD !!!"; exit 1; }
+        else
+            git checkout -b "$branch" --track "origin/$branch" || { echo "!!! git checkout -b $branch failed in $PWD !!!"; exit 1; }
+        fi
+        pull_args=(origin "$branch")
+    fi
+
+    git pull "${pull_args[@]}" || { echo "!!! git pull failed in $PWD !!!"; exit 1; }
+done
+
+if [ ${#submodules[@]} -gt 0 ]; then
+    echo ""
+    echo "--- final consistency check ---"
+    check_consistency
+fi
+
+echo ""
+echo "=== pull-all done ==="

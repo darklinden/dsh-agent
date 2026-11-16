@@ -1,0 +1,8 @@
+.DS_Store
+.env
+dsh-blender.config.json
+var/
+backups/
+bin/ai-bridge
+bin/ma
+bin/photocraft-cli

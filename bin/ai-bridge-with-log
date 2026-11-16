@@ -1,0 +1,59 @@
+#!/usr/bin/env zsh
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+# ai-bridge 启动脚本：把 stdout/stderr（[REQ]/[RESP]/[RECV]/[ERR] 全量）落盘，按天轮转。
+# 启动后立即返回，ai-bridge 在后台独立运行（不随终端关闭而退出）。
+#
+# 用法（bin/ 在 PATH 上）：
+#   启动（后台运行，命令立刻返回）: ai-bridge-with-log [profile]
+#   实时看日志                     : tail -f "$ROOT/var/logs/ai-bridge/ai-bridge-$(date +%Y%m%d).log"
+#   停止                           : kill "$(cat "$ROOT/var/logs/ai-bridge/ai-bridge.pid")"
+#   看是否在跑                     : ps -p "$(cat "$ROOT/var/logs/ai-bridge/ai-bridge.pid")"
+#
+# 说明：
+#   - [profile] 原样透传给 ai-bridge：缺省加载 ~/.ai-bridge/default.toml，
+#     `ai-bridge-with-log deepseek` 加载 ~/.ai-bridge/deepseek.toml，
+#     `ai-bridge-with-log --list` 列出所有配置。
+#   - 日志写到 $ROOT/var/logs/ai-bridge/ai-bridge-YYYYMMDD.log，每天一个文件，天然按天轮转。
+#   - reqlog.rs 直写 stdout（绕过 tracing），tracing 输出也走 stdout；
+#     因此必须重定向整个进程的 stdout/stderr 才能全量捕获。
+#   - 已有实例在跑时不会重复启动（依据 $ROOT/var/logs/ai-bridge/ai-bridge.pid）。
+set -euo pipefail
+cd "$ROOT"
+
+# 一次性命令（列配置 / 帮助）直接前台跑完退出，不要留在后台。
+case "${1:-}" in
+  -l|--list|-h|--help) exec "$SCRIPT_DIR/ai-bridge" "$@" ;;
+esac
+
+mkdir -p "$ROOT/var/logs/ai-bridge"
+LOG="$ROOT/var/logs/ai-bridge/ai-bridge-$(date +%Y%m%d).log"
+PIDFILE="$ROOT/var/logs/ai-bridge/ai-bridge.pid"
+
+if [[ -f "$PIDFILE" ]] && kill -0 "$(<"$PIDFILE")" 2>/dev/null; then
+  echo "[ai-bridge-with-log] 已在运行 (pid $(<"$PIDFILE"))，日志 -> $LOG"
+  exit 0
+fi
+
+export RUST_BACKTRACE=1
+export RUST_LOG=debug
+
+echo "[ai-bridge-with-log] $(date '+%F %T') starting ai-bridge $*" >>"$LOG"
+# nohup + 重定向 + disown：脱离当前终端，脚本退出后进程继续跑，输出只落盘。
+nohup "$SCRIPT_DIR/ai-bridge" "$@" >>"$LOG" 2>&1 </dev/null &
+PID=$!
+print -r -- "$PID" >"$PIDFILE"
+disown "$PID" 2>/dev/null || true
+
+sleep 0.5
+if kill -0 "$PID" 2>/dev/null; then
+  echo "[ai-bridge-with-log] ai-bridge 已在后台启动 (pid $PID)，日志 -> $LOG"
+  echo "[ai-bridge-with-log] 实时查看: tail -f $LOG    停止: kill $PID"
+else
+  echo "[ai-bridge-with-log] 启动失败，最近日志：" >&2
+  tail -n 20 "$LOG" >&2
+  exit 1
+fi

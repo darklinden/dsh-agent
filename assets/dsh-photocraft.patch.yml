@@ -1,0 +1,30 @@
+# dsh-photocraft — the Photocraft MCP row, installed into the dsh-photocraft
+# home's own patch layer (~/.dsh-photocraft/cordis.patch.yml is a symlink to this
+# file), so every profile booted in that home mounts it. Values resolve from the
+# environment at boot: no path and no secret is baked in, and a bare
+# `dsh-agent photocraft` launch without the launcher still works — PHOTOCRAFT_CLI
+# falls back to its default path and DSP_MCP_ROOT to dsh's own cwd.
+#
+# MCP rows belong to a patch layer, not to an agent preset: the shipped presets
+# (standard/ptc/minimal/cordis) declare agent-plane plugins only. Tools register
+# as mcp__photocraft__<tool> and join the model tool set automatically.
+- insert:
+    - id: mcp-dsh-photocraft
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: stdio
+        serverName: photocraft
+        command: !!js process.env.PHOTOCRAFT_CLI ?? (process.env.DSH_AGENT_ROOT + '/bin/photocraft-cli')
+        # Folded scalar, not a tagged flow sequence: the loader's !!js tag is
+        # kind: scalar, so it may only annotate scalar nodes. The expression
+        # evaluates to the argv array; each element is passed verbatim, so a
+        # root with spaces or quotes needs no YAML/argv escaping at all. Both
+        # roots are the SAME directory on purpose: read and write authority are
+        # independent in photocraft, so a read-only grant would leave every
+        # doc_save failing. The flag is single-valued (the last one wins, no
+        # multi-root allowlist), so widening the scope means picking a common
+        # parent — or relaunching from that parent.
+        # `failOnStartupError` stays at its default false: a broken CLI costs
+        # these tools only, never the boot.
+        args: !!js >-
+          ['mcp', '--automation-read-root', (process.env.DSP_MCP_ROOT ?? process.cwd()), '--automation-write-root', (process.env.DSP_MCP_ROOT ?? process.cwd())]

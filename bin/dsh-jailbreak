@@ -1,0 +1,175 @@
+#!/usr/bin/env zsh
+
+# dsh-jailbreak [app-args...] — dsh-agent in its own dsh home, with the
+# dsh-purge plugin installed: the 破甲 (jailbreak) launcher.
+#
+# A thin front end for `dsh-agent` (see that file for the .env contract, the
+# pinned route, telemetry-off, the web_search takeover and the wrong-cmd guard).
+# This script does one thing and hands over: it makes sure this home's profile
+# carries the dsh-purge plugin, then execs `dsh-agent <home>` — same argv, one
+# home to the left.
+#
+# Why a home: $DSH_HOME is the single root for profiles, sessions, credentials,
+# patch layers and the plugin's own runtime files (prompt-inject.md, rules/,
+# skills/, net-scope-allow.txt, redteam/), so the jailbreak home is a second,
+# fully independent suite. One thing a home does NOT isolate: dsh-purge's Apply
+# rewrites rendered copy, defaults and runtime logic inside the installed
+# @deepseek-ai/* packages, and that install is shared by every home — the
+# plugin's own README scopes it that way. Apply is idempotent and reversible
+# from the plugin itself (`/purge revert`, `dsh-purge --uninstall`).
+#
+# Install-once: dsh-purge is a profile dependency that declares
+# `dsh.bundle.patch`, so `dsh plugin --profile <p> -- add <source>` installs it
+# AND registers it in `dsh.profile.bundles` — dsh reconciles the bundle list
+# itself, nothing here is hand-edited. The check is the installed package plus
+# the bundle row, so a half-removed state is repaired; a state that is already
+# complete is left alone and nothing is downloaded. The install runs only for a
+# profile that already exists: `dsh plugin` initializes a missing profile from
+# the generic template (no pi-tui bundle), so a fresh home is reported with the
+# exact command instead — the same one-time, explicit install dsh-agent asks for.
+#
+# Home layer: the plugin's own bundle patch declares
+# `personaSuffix: Your working directory is {{cwd}}.`, while this dsh build
+# registers only {{provider}} and {{model}} — the unknown variable aborts EVERY
+# turn at prompt assembly (the TUI just says "sending" and the session records
+# the error). This home's own `cordis.patch.yml`, applied after every bundle
+# layer, re-declares that one row with the same text produced at boot; it is
+# installed once like the plugin and never repointed.
+#
+# Source: the plugin ships as `dsh-purge-community`; npm still carries no
+# `dsh-purge`, so the default source is the GitHub repo pinned below. The
+# installed package name is what plugin_ready() checks — override both together
+# with DSH_JAILBREAK_PLUGIN_SOURCE / DSH_JAILBREAK_PLUGIN_PKG.
+#
+# dsh-jailbreak-only environment variables:
+#   DSH_JAILBREAK_HOME_NAME      optional. dsh home selector handed to dsh-agent
+#                                (default: jailbreak, i.e. ~/.dsh-jailbreak).
+#   DSH_JAILBREAK_PLUGIN_SOURCE  optional. Install source for `dsh plugin ... add`
+#                                (default: github:darklinden/dsh-purge-community).
+#                                Point it at a local clone (`.` or an absolute
+#                                path) to install a working copy instead.
+#   DSH_JAILBREAK_PLUGIN_PKG     optional. Installed package name (default:
+#                                dsh-purge-community), checked after install.
+#
+# Everything else is dsh-agent's: DDD_* for the route, DSA_WEB_SEARCH,
+# DSH_PI_TUI_PROFILE / _PRESET / _RESUME_SESSION / _WORKSPACE_TARGET,
+# DSH_CMD_GUARD.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+JAILBREAK_HOME_NAME="${DSH_JAILBREAK_HOME_NAME:-jailbreak}"
+# Same character set dsh-agent accepts, plus its own rule: the name is handed to
+# dsh-agent as its first argument, so a leading '-' would be read as a flag there
+# and the home this script just installed into would silently not be the home
+# that boots.
+case "$JAILBREAK_HOME_NAME" in
+    .*|-*|*[!A-Za-z0-9._-]*)
+        echo "dsh-jailbreak: invalid DSH_JAILBREAK_HOME_NAME '$JAILBREAK_HOME_NAME' (letters, digits, '.', '_', '-' only; must not start with '.' or '-')" >&2
+        exit 2
+        ;;
+esac
+DSH_HOME_DIR="$HOME/.dsh-$JAILBREAK_HOME_NAME"
+# dsh-agent sources this same .env before it picks the profile, so a
+# DSH_PI_TUI_PROFILE set there would otherwise be missed here — the plugin would
+# be installed into one profile while another one boots, silently without it.
+# Sourced rather than parsed so the value has exactly the semantics dsh-agent
+# gives it. The home name above is read before this, so an explicit environment
+# choice still outranks the shared file.
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    source "$ROOT/.env"
+    set +a
+fi
+# Must be the same selector dsh-agent will use, or the plugin would be installed
+# into one profile while another one boots.
+PROFILE="${DSH_PI_TUI_PROFILE:-pi-tui}"
+PROFILE_DIR="$DSH_HOME_DIR/profiles/$PROFILE"
+PLUGIN_SOURCE="${DSH_JAILBREAK_PLUGIN_SOURCE:-github:darklinden/dsh-purge-community}"
+PLUGIN_PKG="${DSH_JAILBREAK_PLUGIN_PKG:-dsh-purge-community}"
+
+if ! command -v dsh >/dev/null 2>&1; then
+    echo "dsh is not on PATH. Install it first:"
+    echo "  npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs @deepseek-ai/dsh@latest"
+    exit 1
+fi
+
+# The plugin lives in the profile's own dependency set, so the profile comes
+# first: `dsh plugin --profile X -- add` would otherwise initialize X from the
+# generic template — a home that passes dsh-agent's profile check but boots no
+# TUI. Report it, never populate it.
+if [ ! -f "$PROFILE_DIR/package.json" ]; then
+    echo "dsh profile '$PROFILE' is not installed under $DSH_HOME_DIR. Install dsh-pi-tui first:"
+    echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add @xmoon76/dsh-pi-tui@latest"
+    exit 1
+fi
+
+# Installed = the package is unpacked, still declared as a dependency, and still
+# selected as a bundle. Any half missing means the plugin would not load or would
+# not survive the next install, so all three are (re)installed together; a
+# complete state costs nothing and touches the network never.
+plugin_ready() {
+    [ -f "$PROFILE_DIR/node_modules/$PLUGIN_PKG/package.json" ] \
+        && node -e 'const m = require(process.argv[1]); const d = m.dependencies ?? {}; process.exit((m.dsh?.profile?.bundles ?? []).includes(process.argv[2]) && process.argv[2] in d ? 0 : 1)' "$PROFILE_DIR/package.json" "$PLUGIN_PKG"
+}
+PLUGIN_STATE=present
+if ! plugin_ready; then
+    echo "Jailbreak: installing $PLUGIN_PKG into $PROFILE_DIR ..."
+    if DSH_HOME="$DSH_HOME_DIR" dsh plugin --profile "$PROFILE" -- add "$PLUGIN_SOURCE"; then
+        # Re-check rather than trust the exit code: dsh registers a bundle only
+        # for a package that declares `dsh.bundle.patch`, so a source that is not
+        # the plugin installs silently and boots without it.
+        if plugin_ready; then PLUGIN_STATE=installed; else PLUGIN_STATE=partial; fi
+    else
+        PLUGIN_STATE=failed
+    fi
+fi
+
+case "$PLUGIN_STATE" in
+    installed) echo "Jailbreak: $PLUGIN_PKG installed -> $PROFILE_DIR"
+               echo "Jailbreak: adding the plugin does not patch the host — in the session run /purge apply (it restarts the host)."
+               ;;
+    present)   echo "Jailbreak: $PLUGIN_PKG present -> $PROFILE_DIR" ;;
+    partial)   echo "Jailbreak: WARNING — the install command succeeded but $PLUGIN_PKG is still not selected in $PROFILE_DIR;" >&2
+               echo "           check that \"$PLUGIN_SOURCE\" is the $PLUGIN_PKG plugin. This session boots without it." >&2
+               ;;
+    failed)    echo "Jailbreak: WARNING — could not install $PLUGIN_PKG; this session boots without it." >&2
+               echo "           retry: DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add \"$PLUGIN_SOURCE\"" >&2
+               ;;
+esac
+# Home-level patch layer: `$DSH_HOME/cordis.patch.yml` is applied after every
+# bundle layer, so it is the seam that repairs the one thing the dsh-purge bundle
+# patch gets wrong on this host (see dsh-jailbreak.patch.yml for the full why).
+# Installed once and never repointed — an entry that already exists may be the
+# user's own home layer, so it is only reported. The report is loud on purpose:
+# without this layer every turn aborts while the prompt is assembled.
+PATCH_SRC="$ROOT/assets/dsh-jailbreak.patch.yml"
+HOME_PATCH="$DSH_HOME_DIR/cordis.patch.yml"
+PATCH_STATE=present
+if [ ! -e "$PATCH_SRC" ]; then
+    PATCH_STATE=no-src
+elif [ ! -e "$HOME_PATCH" ] && [ ! -L "$HOME_PATCH" ]; then
+    if mkdir -p "$DSH_HOME_DIR" \
+        && ln -s "$PATCH_SRC" "$HOME_PATCH" \
+        && [ -e "$HOME_PATCH" ]; then
+        PATCH_STATE=installed
+    else
+        PATCH_STATE=missing
+    fi
+elif [ -L "$HOME_PATCH" ] && [ ! -e "$HOME_PATCH" ]; then
+    PATCH_STATE=dangling
+elif [ "$(realpath "$HOME_PATCH" 2>/dev/null)" != "$(realpath "$PATCH_SRC" 2>/dev/null)" ]; then
+    PATCH_STATE=foreign
+fi
+
+case "$PATCH_STATE" in
+    installed) echo "Jailbreak: home layer installed -> $HOME_PATCH" ;;
+    present)   echo "Jailbreak: home layer present -> $HOME_PATCH" ;;
+    dangling)  echo "Jailbreak: WARNING — $HOME_PATCH is a dangling symlink; the system-prompt fix will not load and every turn fails at prompt assembly." >&2 ;;
+    foreign)   echo "Jailbreak: WARNING — $HOME_PATCH is not this launcher's layer; unless it carries the system-prompt fix, every turn fails at prompt assembly." >&2 ;;
+    no-src)    echo "Jailbreak: WARNING — $PATCH_SRC is missing, so the home layer cannot be installed." >&2 ;;
+    missing)   echo "Jailbreak: WARNING — could not create $HOME_PATCH; every turn fails at prompt assembly." >&2 ;;
+esac
+echo "Jailbreak: home $DSH_HOME_DIR (profile $PROFILE)"
+exec "$SCRIPT_DIR/dsh-agent" "$JAILBREAK_HOME_NAME" "$@"

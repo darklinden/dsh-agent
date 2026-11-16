@@ -1,0 +1,145 @@
+#!/bin/sh
+
+# wrong-cmd-subcmd — the subcommand-aware half of the dsh launchers' guard
+# (dsh-agent / dsh-photocraft / dsh-jailbreak). Sibling of wrong-cmd, in the same
+# wrong-cmd.d/ shim list.
+#
+# wrong-cmd deliberately ignores its arguments, which is exactly right for a
+# whole command (rm, ssh, …) and exactly wrong for git / npm / pnpm: there is
+# one `git` on PATH, and wrapping the NAME would also refuse `git status`. So
+# those three names point here instead:
+#
+#   * the subcommand word is matched against the block list in the `case` below
+#     — for git the first non-option word, for npm / pnpm any argument equal to
+#     a blocked word, because their options may sit on either side of it;
+#   * a match reports the wrong-command notice and exits 1 WITHOUT starting the
+#     real binary, so no repository, index, ref or registry is touched;
+#   * anything else execs the real binary with the original argv untouched, so
+#     every other subcommand behaves exactly as before (same flags, same exit
+#     status, same output) at the cost of one small shell.
+#
+# Local only: no hooks, no aliases, nothing evaluated from the arguments. An
+# exported shell function of the same name (BASH_FUNC_git%%) wins over PATH and
+# is outside the guard, as are an absolute path (/usr/bin/git), a rewritten
+# PATH, a wrapper that does not go through PATH, a subcommand hidden behind an
+# option this script does not know, and a name renamed by an alias
+# (`git -c alias.p=push p`, or a configured `[alias]`) — the guard judges the
+# word it was given. This is a speed bump, not a sandbox.
+#
+# Maintained in exactly two places: the block list in the `case` statement here,
+# and the wrong-cmd.d/ symlinks that decide which names are wrapped at all.
+
+name=${0##*/}
+
+# Where this script lives, without calling dirname: the search below must work
+# even when the shim directory is the only entry on PATH.
+self_path=$0
+case $self_path in
+    */*) ;;
+    *) self_path=./$self_path ;;
+esac
+
+# Resolve the real binary: the first executable of this name on PATH that is not
+# this very script. `-ef` compares device and inode, so it also rejects the same
+# file reached through another spelling (`/dir/`, `./dir`, a path alias to the
+# shim directory) — that is what stops the shim from exec'ing itself forever.
+real=
+old_ifs=$IFS
+IFS=:
+set -f
+for d in $PATH; do
+    [ -n "$d" ] || d=.
+    d=${d%/}
+    [ -n "$d" ] || d=/
+    cand=$d/$name
+    if [ -f "$cand" ] && [ -x "$cand" ]; then
+        [ "$cand" -ef "$self_path" ] && continue
+        real=$cand
+        break
+    fi
+done
+set +f
+IFS=$old_ifs
+
+if [ -z "$real" ]; then
+    echo "wrong-cmd: no real '$name' on PATH outside this guard — nothing ran." >&2
+    exit 1
+fi
+
+# The block list. Subcommand-level, short, and deliberately limited to actions
+# that belong to the human who started the session. A symlinked name with no
+# entry here is a maintenance error, so it says so instead of pretending.
+case $name in
+    git)      blocked='commit push pull merge rebase reset' ;;
+    npm|pnpm) blocked='publish' ;;
+    *)
+        echo "wrong-cmd-subcmd: '$name' has no block list here — running it unguarded" >&2
+        exec "$real" "$@"
+        ;;
+esac
+
+hit=
+if [ "$name" = "git" ]; then
+    # git's global options are few and fixed, so the subcommand is the first
+    # non-option word. The value-taking ones are skipped WITH their value, so
+    # `git -C /repo commit` and `git -c a=b push` still read as the subcommand
+    # they are; `--opt=value` consumes itself; `--` ends the options, so what
+    # follows is never a subcommand. Bare flags (`-p`, `--no-pager`) are passed
+    # over, which keeps `git -p status` reading as `status`.
+    word=
+    skip=
+    for a in "$@"; do
+        if [ -n "$skip" ]; then
+            skip=
+            continue
+        fi
+        case $a in
+            --) break ;;
+            -c|-C|--git-dir|--work-tree|--namespace|--exec-path|--config-env \
+            |--super-prefix|--attr-source)
+                skip=1
+                continue
+                ;;
+            --*=*|-*) ;;
+            *)
+                word=$a
+                break
+                ;;
+        esac
+    done
+    for b in $blocked; do
+        [ "$word" = "$b" ] && hit=$b
+    done
+else
+    # npm / pnpm accept global options on either side of the command and their
+    # option arity is not worth guessing (`npm --tag beta publish`), so every
+    # argument equal to a blocked word counts. A package or script literally
+    # named 'publish' is refused too — the noisy direction, on purpose.
+    for a in "$@"; do
+        case $a in -*) continue ;; esac
+        for b in $blocked; do
+            if [ "$a" = "$b" ]; then
+                hit=$b
+                break
+            fi
+        done
+        [ -n "$hit" ] && break
+    done
+fi
+
+[ -z "$hit" ] && exec "$real" "$@"
+
+printf '%s\n' \
+    "wrong-cmd: '$name $hit' is blocked in this session — you are running the wrong command." \
+    "" \
+    "The launcher routes '$name' through this guard, and '$hit' is on its block list" \
+    "($blocked), so nothing ran: no file, repository, branch, index or registry was" \
+    "touched. Every other subcommand of '$name' still works normally." \
+    "" \
+    "Do not retry with different flags, an alias, an exported shell function, or an" \
+    "absolute path (/usr/bin/$name): that is the same wrong command." \
+    "" \
+    "Commits, syncs, history rewrites and publishes belong to the human who started" \
+    "the session. Stop here and ask the user to run it." >&2
+
+exit 1

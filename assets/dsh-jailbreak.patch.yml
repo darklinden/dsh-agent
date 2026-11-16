@@ -1,0 +1,23 @@
+# dsh-jailbreak — the home-level patch layer for the jailbreak home
+# (~/.dsh-jailbreak/cordis.patch.yml is a symlink to this file).
+#
+# Why it exists: dsh-purge's runtime prompt rewrite sets the
+# `deployment:persona-suffix` section text to
+#
+#   "Your working directory is {{cwd}}."
+#
+# and assumes the host interpolates `cwd` next to `model`/`provider`. This dsh
+# build (0.2.1-rc.2) registers only `provider` and `model`, so prompt assembly
+# throws on EVERY turn — the TUI just says "sending" and the session records:
+#
+#   turn/end ... unknown prompt variable "{{cwd}}" in section
+#   "deployment:persona-suffix"; registered variables: provider, model
+#
+# No static config can repair it: the plugin normalizes any cwd-only suffix back
+# to that exact template (lib/identity.js → isCwdOnlyText / looksLikeOfficialIdentity),
+# so what is missing is the variable itself. It is registered by the module beside
+# this file, and this layer is mounted only in this home, so a plain
+# `dsh --profile pi-tui` launch anywhere else is untouched.
+- insert:
+    - id: dsh-jailbreak-cwd-variable
+      name: !!js process.env.DSH_AGENT_ROOT + '/assets/dsh-jailbreak-cwd-variable.mjs'

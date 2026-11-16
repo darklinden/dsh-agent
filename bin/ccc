@@ -1,0 +1,130 @@
+#!/usr/bin/env zsh
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+echo "Load environment variables ..."
+
+if [ -f "$ROOT/.env" ]; then
+    echo "Loading environment variables from $ROOT/.env ..."
+    set -a
+    source "$ROOT/.env"
+    set +a
+fi
+
+if [ -z "$CCC_BASE_URL" ]; then
+    echo "CCC_BASE_URL is not set. Please set CCC_BASE_URL in .env file."
+    exit 1
+fi
+
+if [ -z "$CCC_AUTH_TOKEN" ]; then
+    echo "CCC_AUTH_TOKEN is not set. Please set CCC_AUTH_TOKEN in .env file."
+    exit 1
+fi
+
+if [ -z "$CCC_MODEL" ]; then
+    echo "CCC_MODEL is not set. Please set CCC_MODEL in .env file."
+    exit 1
+fi
+
+# Completely disable usage metrics and error reporting
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+
+# Disable automated feedback surveys and auto-memory loops
+export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+
+# Disable OpenTelemetry SDK tracers completely
+export OTEL_SDK_DISABLED=true
+export OTEL_TRACES_EXPORTER=none
+export OTEL_METRICS_EXPORTER=none
+export OTEL_LOGS_EXPORTER=none
+
+# Disable analytics in Claude Code
+export CLAUDE_CODE_ANALYTICS=false
+
+# Disable auto-updater for Claude Code
+export DISABLE_AUTOUPDATER=1
+
+# Disable git instructions in Claude Code
+export CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1
+
+# Disable experimental betas in Claude Code
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+
+# Disable Thrifty Sonic in Claude Code
+export CLAUDE_CODE_THRIFTY_SONIC=0
+
+export ANTHROPIC_BASE_URL=$CCC_BASE_URL
+export ANTHROPIC_AUTH_TOKEN=$CCC_AUTH_TOKEN
+export ANTHROPIC_MODEL=$CCC_MODEL
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$CCC_MODEL
+export ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=thinking,adaptive_thinking,temperature,effort,max_effort
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$CCC_MODEL
+export ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES=thinking,adaptive_thinking,temperature,effort,max_effort
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$CCC_MODEL
+export ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES=thinking,adaptive_thinking,temperature,effort,max_effort
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+export CLAUDE_CODE_SUBAGENT_MODEL=$CCC_MODEL
+
+claude --verbose $@
+
+
+## ~/.claude/settings.json
+# {
+#   "skipWebFetchPreflight": true,
+#   "permissions": {
+#     "deny": [
+#       "WebSearch",
+#       "Read(**/.env*)",
+#       "Read(**/*.pem)",
+#       "Read(**/*.key)",
+#       "Read(**/secrets/**)",
+#       "Edit(.claude/settings.json)",
+#       "Bash(rm -rf:*)",
+#       "Bash(del /5:*)",
+#       "Bash(rmdir /s:*)",
+#       "Bash(rd /s:*)",
+#       "Bash(format:*)",
+#       "Bash(git commit:*)",
+#       "Bash(git push:*)",
+#       "Bash(git pull:*)",
+#       "Bash(git merge:*)",
+#       "Bash(git rebase:*)",
+#       "Bash(git reset:*)",
+#       "Bash(npm publish:*)",
+#       "Bash(pnpm publish:*)"
+#     ]
+#   }
+# }
+
+
+## "claudeCode.environmentVariables": [
+# { "name": "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "value": "1" },
+# { "name": "DISABLE_TELEMETRY", "value": "1" },
+# { "name": "DISABLE_ERROR_REPORTING", "value": "1" },
+# { "name": "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "value": "1" },
+# { "name": "CLAUDE_CODE_DISABLE_AUTO_MEMORY", "value": "1" },
+# { "name": "OTEL_SDK_DISABLED", "value": "true" },
+# { "name": "OTEL_TRACES_EXPORTER", "value": "none" },
+# { "name": "OTEL_METRICS_EXPORTER", "value": "none" },
+# { "name": "OTEL_LOGS_EXPORTER", "value": "none" },
+# { "name": "CLAUDE_CODE_ANALYTICS", "value": "false" },
+# { "name": "DISABLE_AUTOUPDATER", "value": "1" },
+# { "name": "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "value": "1" },
+# { "name": "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "value": "1" },
+# { "name": "ANTHROPIC_BASE_URL", "value": "https://api.deepseek.com/anthropic" },
+# { "name": "ANTHROPIC_AUTH_TOKEN", "value": "" },
+# { "name": "ANTHROPIC_MODEL", "value": "deepseek-v4-flash" },
+# { "name": "ANTHROPIC_DEFAULT_OPUS_MODEL", "value": "deepseek-v4-flash" },
+# { "name": "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "value": "thinking,adaptive_thinking,temperature,effort,max_effort" },
+# { "name": "ANTHROPIC_DEFAULT_SONNET_MODEL", "value": "deepseek-v4-flash" },
+# { "name": "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "value": "thinking,adaptive_thinking,temperature,effort,max_effort" },
+# { "name": "ANTHROPIC_DEFAULT_HAIKU_MODEL", "value": "deepseek-v4-flash" },
+# { "name": "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "value": "thinking,adaptive_thinking,temperature,effort,max_effort" },
+# { "name": "CLAUDE_CODE_ATTRIBUTION_HEADER", "value": "0" },
+# { "name": "CLAUDE_CODE_SUBAGENT_MODEL", "value": "deepseek-v4-flash" }
+#]

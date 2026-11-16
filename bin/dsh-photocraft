@@ -1,0 +1,167 @@
+#!/usr/bin/env zsh
+
+# dsh-photocraft [app-args...] — dsh-agent in its own dsh home: the Photocraft
+# launcher.
+#
+# A thin front end for `dsh-agent` (see that file for the .env contract, the
+# pinned route, telemetry-off, the web_search takeover and the wrong-cmd guard).
+# This script does two things and hands over:
+#
+#   1. it validates the Photocraft automation root — the directory this launcher
+#      was started in, unless DSP_AUTOMATION_ROOT overrides it — and exports the
+#      two values the MCP row resolves at boot: DSP_MCP_ROOT, PHOTOCRAFT_CLI;
+#   2. it makes sure the dsh-photocraft home has the Photocraft MCP row
+#      installed, then execs `dsh-agent <home>`: same argv, one home to the left.
+#
+# Why a home and not an extra overlay: $DSH_HOME is the single root for
+# profiles, sessions, credentials and patch layers, and
+# `$DSH_HOME/cordis.patch.yml` is the home-level user layer applied to every
+# profile booted in that home. The Photocraft row therefore belongs to the home
+# that exists to carry it, needs no extension point in `dsh-agent`, and is
+# installed exactly once — a missing link is created, anything already in place
+# is left alone. The link target is tracked in assets/, so editing it
+# takes effect on the next launch, and a real file written in its place (a user's
+# own home layer) is never touched.
+#
+# Photocraft scope: photocraft-cli grants automation filesystem access ONLY
+# through --automation-read-root / --automation-write-root, and with no root at
+# all every doc_open/doc_save fails with "automation filesystem access is not
+# granted". Read and write authority are independent (a write root does not
+# grant reads, and vice versa), each flag is single-valued — the LAST occurrence
+# wins, it is not a multi-root allowlist — and an absolute path is accepted only
+# when it is literally inside that root, with `..` rejected outright. Measured
+# behavior also shows the check is a plain string prefix, NOT a symlink-resolved
+# one: with root /tmp, /private/tmp/x.psd is refused (and the mirror image
+# likewise). That is why the root below is exported as the shell's logical $PWD
+# — the same text the agent's own `pwd` prints — rather than `pwd -P`.
+#
+# dsh-photocraft-only environment variables:
+#   DSP_HOME_NAME        optional. dsh home selector handed to dsh-agent (default:
+#                        photocraft, i.e. ~/.dsh-photocraft). dsh-agent's own `$1`
+#                        selector is not used here: this launcher always boots
+#                        this home.
+#   DSP_AUTOMATION_ROOT  optional. Overrides the Photocraft automation root
+#                        (default: $PWD at launch). Set it when the agent's
+#                        Photocraft scope must differ from the directory you
+#                        happen to launch in.
+#   PHOTOCRAFT_CLI       optional. Path to the Photocraft CLI (default:
+#                        <repo>/bin/photocraft-cli). A non-executable value
+#                        only costs this MCP server's tools, never the boot.
+#
+# Everything else is dsh-agent's: DDD_* for the route, DSA_WEB_SEARCH,
+# DSH_PI_TUI_PROFILE / _PRESET / _RESUME_SESSION / _WORKSPACE_TARGET,
+# DSH_CMD_GUARD. The original launcher's own DSP_WEB_SEARCH and DSH_TUI_* names
+# are gone with the dsh-tui generation it fronted; nothing else referenced them.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+DSP_HOME_NAME="${DSP_HOME_NAME:-photocraft}"
+# Same character set dsh-agent accepts, plus its own rule: the name is handed to
+# dsh-agent as its first argument, so a leading '-' would be read as a flag there
+# and the home this script just installed into would silently not be the home
+# that boots.
+case "$DSP_HOME_NAME" in
+    .*|-*|*[!A-Za-z0-9._-]*)
+        echo "dsh-photocraft: invalid DSP_HOME_NAME '$DSP_HOME_NAME' (letters, digits, '.', '_', '-' only; must not start with '.' or '-')" >&2
+        exit 2
+        ;;
+esac
+DSH_HOME_DIR="$HOME/.dsh-$DSP_HOME_NAME"
+
+# Photocraft automation scope: the directory this launcher was started in,
+# captured before anything below can change directories. $PWD (logical) is
+# deliberate — photocraft compares the root textually, so it must be the same
+# spelling the agent will use for absolute paths.
+DSP_AUTOMATION_ROOT="${DSP_AUTOMATION_ROOT:-$PWD}"
+case "$DSP_AUTOMATION_ROOT" in
+    /*) ;;
+    *)
+        echo "DSP_AUTOMATION_ROOT must be an absolute path (got: $DSP_AUTOMATION_ROOT)."
+        exit 1
+        ;;
+esac
+DSP_AUTOMATION_ROOT="${DSP_AUTOMATION_ROOT%/}"
+[ -n "$DSP_AUTOMATION_ROOT" ] || DSP_AUTOMATION_ROOT="/"
+if [ ! -d "$DSP_AUTOMATION_ROOT" ]; then
+    echo "Photocraft automation root is not a directory: $DSP_AUTOMATION_ROOT"
+    exit 1
+fi
+# Non-canonical spellings still work as a root, but every request is matched
+# against the root textually, so `//` or a `..` segment makes the agent's own
+# `pwd` spelling fail the check. Warn instead of fixing it up silently.
+case "$DSP_AUTOMATION_ROOT" in
+    *//*|*/../*|*/..)
+        echo "Warning: Photocraft root '$DSP_AUTOMATION_ROOT' is not canonical ('//' or '..')." >&2
+        echo "         Requests are matched textually — prefer the exact spelling from \`pwd\`." >&2
+        ;;
+esac
+if [ "$DSP_AUTOMATION_ROOT" = "/" ]; then
+    echo "Warning: Photocraft read/write root is / — the whole filesystem is granted." >&2
+fi
+if [ -e "$DSP_AUTOMATION_ROOT/.env" ]; then
+    echo "Warning: Photocraft root contains a .env — the agent can read and rewrite it" >&2
+    echo "         through Photocraft. Launch from a project directory instead." >&2
+fi
+DSP_MCP_ROOT="$DSP_AUTOMATION_ROOT"
+
+PHOTOCRAFT_CLI="${PHOTOCRAFT_CLI:-$SCRIPT_DIR/photocraft-cli}"
+# Spawned by dsh's MCP client from its own cwd, so a relative or `~`-spelled
+# value would resolve against the wrong directory: require an absolute path.
+case "$PHOTOCRAFT_CLI" in
+    /*) ;;
+    *)
+        echo "PHOTOCRAFT_CLI must be an absolute path (got: $PHOTOCRAFT_CLI)."
+        exit 1
+        ;;
+esac
+# A directory passes -x, so the file test is kept as well: the row would
+# otherwise be installed with a directory as its command.
+if [ ! -f "$PHOTOCRAFT_CLI" ] || [ ! -x "$PHOTOCRAFT_CLI" ]; then
+    echo "Photocraft: warning — not an executable file: $PHOTOCRAFT_CLI (its MCP tools will not start)" >&2
+fi
+export DSP_MCP_ROOT PHOTOCRAFT_CLI
+
+# The shared .env is sourced by dsh-agent AFTER this script exports the two values
+# above, so an entry there would silently win over the checks just made. .env is
+# the ccc/dsh-agent endpoint file and has no business defining these: say so if a
+# future edit adds one. Only the NAMES are ever echoed, never a value.
+if [ -f "$ROOT/.env" ] \
+   && grep -qE '^[[:space:]]*(export[[:space:]]+)?(DSP_MCP_ROOT|PHOTOCRAFT_CLI)=' "$ROOT/.env"; then
+    echo "Warning: $ROOT/.env defines DSP_MCP_ROOT or PHOTOCRAFT_CLI — dsh-agent re-sources it, so those values win over this launcher's checks." >&2
+fi
+
+# Install the Photocraft MCP row into this home's own patch layer, once. A
+# dangling link is NOT "installed": dsh's loader treats the missing file as no
+# overlay at all, so the tools would vanish silently. It is never repointed —
+# it may be the user's own link — only reported.
+PATCH_SRC="$ROOT/assets/dsh-photocraft.patch.yml"
+HOME_PATCH="$DSH_HOME_DIR/cordis.patch.yml"
+PATCH_STATE=present
+if [ ! -e "$PATCH_SRC" ]; then
+    PATCH_STATE=no-src
+elif [ ! -e "$HOME_PATCH" ] && [ ! -L "$HOME_PATCH" ]; then
+    if mkdir -p "$DSH_HOME_DIR" \
+        && ln -s "$PATCH_SRC" "$HOME_PATCH" \
+        && [ -e "$HOME_PATCH" ]; then
+        PATCH_STATE=installed
+    else
+        PATCH_STATE=missing
+    fi
+elif [ -L "$HOME_PATCH" ] && [ ! -e "$HOME_PATCH" ]; then
+    PATCH_STATE=dangling
+elif [ "$(realpath "$HOME_PATCH" 2>/dev/null)" != "$(realpath "$PATCH_SRC" 2>/dev/null)" ]; then
+    PATCH_STATE=foreign
+fi
+
+case "$PATCH_STATE" in
+    installed) echo "Photocraft: MCP row installed -> $HOME_PATCH" ;;
+    present)   echo "Photocraft: MCP row present -> $HOME_PATCH" ;;
+    dangling)  echo "Photocraft: WARNING — $HOME_PATCH is a dangling symlink; the MCP row will not load." >&2 ;;
+    foreign)   echo "Photocraft: WARNING — $HOME_PATCH is not this launcher's layer; unless it carries the Photocraft MCP row, those tools will not load." >&2 ;;
+    no-src)    echo "Photocraft: WARNING — $PATCH_SRC is missing, so the MCP row cannot be installed." >&2 ;;
+    missing)   echo "Photocraft: WARNING — could not create $HOME_PATCH; continuing without the row." >&2 ;;
+esac
+echo "Photocraft: read/write root $DSP_MCP_ROOT (CLI: $PHOTOCRAFT_CLI)"
+exec "$SCRIPT_DIR/dsh-agent" "$DSP_HOME_NAME" "$@"

@@ -1,0 +1,65 @@
+#!/usr/bin/env zsh
+
+# wrong-cmd — the tripwire behind the dsh launchers' dangerous-command guard
+# (dsh-agent / dsh-photocraft / dsh-jailbreak).
+#
+# Every guarded command name is a SYMLINK inside wrong-cmd.d/, and each launcher
+# prepends that directory to PATH before it execs dsh. Most links point at
+# this script; the subcommand-aware trio (git, npm, pnpm) points at the sibling
+# wrong-cmd-subcmd instead, which looks at the subcommand word and lets every
+# other invocation through unchanged. A PATH shim is the only interception that
+# survives into the session's own commands: the bash tool spawns a
+# non-interactive `bash -c`, and aliases are neither exported to it nor expanded
+# by it. The shim therefore reaches the agent's shell calls, its background jobs
+# and subagents, and the TUI's own `!` shell — which is where a wrong command
+# would actually have run.
+#
+# Contract: this script IGNORES every argument. It never runs, forwards or
+# even inspects the command it stands in for, so no flag can turn the guard
+# back into the real thing. It names the command it was invoked as (argv[0],
+# i.e. the symlink — not an argument), writes only to stderr, touches no file,
+# and exits non-zero so the caller sees a failure instead of a silent success.
+#
+# Scope: PATH resolution only. An absolute path (/bin/rm), a rewritten PATH,
+# a shell redirection (`> file`), `find -delete`, `node -e`, the harness's own
+# file tools, any MCP server, and subcommand-level hazards (git clean -fdx,
+# git reset --hard, git checkout -- .) are all outside it. This is a speed bump
+# that tells the agent it went the wrong way, not a sandbox: the harness file
+# sandbox and approval policy stay the authority.
+#
+# Maintained through the wrong-cmd.d/ listing: to guard another command, add a
+# symlink there; to release one, remove it. Nothing else needs editing. Never
+# link an interpreter this script itself needs (`zsh`, `env`, `sh`) — the guard
+# would then block its own shebang.
+
+name="${0:t}"
+
+if [ "$name" = "wrong-cmd" ]; then
+    cat >&2 <<'EOF'
+wrong-cmd: you are running the wrong command.
+
+This is the guard itself, invoked directly. It stands in for a dangerous
+command only when reached through a name in wrong-cmd.d/ — the directory
+dsh-agent / dsh-photocraft / dsh-jailbreak prepend to PATH for the session they
+launch.
+EOF
+else
+    printf 'wrong-cmd: %s is not available in this session — you are running the wrong command.\n\n' "'$name'" >&2
+    cat >&2 <<EOF
+The launcher pointed '$name' at this guard, so nothing ran and nothing changed.
+Arguments are ignored on purpose: this is a tripwire, not the real command.
+Every process this session spawns shares the guard, so this notice can also come
+from a build tool or script that used '$name' internally.
+
+Do not retry through an absolute path (/bin/…, /usr/bin/…), and do not rewrite
+PATH to get around this: that is the same wrong command.
+
+If the action is genuinely needed, use the supported route instead:
+  * deleting a file or directory: check the resolved absolute target, then
+    move it to the OS trash (macOS: trash <abs path>);
+  * ending a process or truncating a file: confirm with the user first;
+  * remote shell, privilege or disk-level operations: ask the user to run it.
+EOF
+fi
+
+exit 1

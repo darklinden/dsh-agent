@@ -1,0 +1,437 @@
+#!/usr/bin/env zsh
+
+# dsh-agent [home-name] [app-args...] — dsh-pi-tui launcher: endpoint declared in
+# .env, all telemetry off.
+#
+# Modeled on ccc: source a side-by-side .env and export it. Unlike ccc, which
+# runs its CLI as a child, this launcher `exec`s it, so signals and the exit
+# code pass straight through.
+# The larger difference: DSH reads no ANTHROPIC_* variables, so the
+# Anthropic-message endpoint reaches the agent as a one-shot --patch overlay
+# that declares an llm-pi-ai route; the overlay holds environment-variable
+# NAMES only and resolves values at boot — it never contains secrets.
+# Precedence note: a persisted /model choice outranks the pinned deployment
+# pair (product rule), so /model can move a later session off this route;
+# the dsa route stays registered either way.
+#
+# Home selection: the first argument, when it is a bare name rather than a flag,
+# picks the dsh home — `dsh-agent p` boots $HOME/.dsh-p, `dsh-agent blender-rt`
+# boots $HOME/.dsh-blender-rt, and no argument keeps the home in force. The
+# selector is consumed here and never reaches dsh, so `dsh-agent p --preset
+# minimal` works; a leading '-' (`dsh-agent --preset minimal`) selects nothing.
+# Precedence: the selector > an inherited $DSH_HOME > ~/.dsh. $DSH_HOME is the
+# single root for profiles (each with its own plugin set), sessions, credentials,
+# agent presets, the home-level cordis.patch.yml and the user-global AGENTS.md,
+# so a second home is a second, fully independent suite; $DSH_AGENTS_HOME, a
+# project's own AGENTS.md, the shared .env at the repository root and the wrong-cmd
+# guard stay shared. A home whose profile is missing is reported, never
+# populated: creating it is a one-time, explicit install (the message names the
+# exact command, plus the pnpm install when pnpm is missing from PATH - `dsh
+# plugin` forwards to pnpm and exits 127 without it). A home that boots without
+# an AGENTS.md gets a copy of the template tracked in assets/
+# (global-AGENTS.md) — first use only, never overwriting an existing file;
+# DSA_SEED_AGENTS=off skips that. Seeding runs
+# last, after every pre-flight check and the overlay swap, so a launch that
+# fails before `exec` leaves nothing behind.
+#
+# Guard note: just before the exec below, wrong-cmd.d/ is prepended to PATH, so
+# the dangerous command names symlinked there (rm, ssh, …) resolve to wrong-cmd,
+# and git/npm/pnpm to the subcommand-aware wrong-cmd-subcmd, instead of the real
+# binary. A PATH shim, not an alias: the bash tool runs a
+# non-interactive shell that never expands aliases. DSH_CMD_GUARD=off launches
+# without the guard; the guarded set is the wrong-cmd.d listing. The outcome is
+# exported as WRONG_CMD_GUARD_STATE (on / off / unavailable) — deliberately not
+# a DSH_* name: dsh rebuilds that namespace for every tool shell.
+#
+# .env variables (shared file with ccc; DDD_* for the route, TAVILY_API_KEY
+# for the MCP row):
+#   DDD_BASE_URL         required. Endpoint root, any http(s) host — local
+#                        gateway or direct upstream — e.g. http://127.0.0.1:18650
+#   DDD_AUTH_TOKEN       required. The endpoint's inbound auth token (any
+#                        non-empty value when the endpoint requires no auth)
+#   DDD_MODEL            required. Upstream model id
+#   DDD_CONTEXT_WINDOW   optional. Model context window in tokens
+#                        (default 1048576; pi-ai would otherwise fall back to
+#                        its 262144 default for a hand-declared model)
+#   DDD_PROTOCOL         optional. anthropic-messages (default) |
+#                        openai-completions | openai-responses
+#   TAVILY_API_KEY       optional. Tavily MCP key for the mcp-tavily row
+#                        below; absent -> the row still loads but registers
+#                        no tools
+#   DSA_WEB_SEARCH       optional. off (default) takes over the active agent
+#                        preset and disables its built-in web_search tool, so
+#                        the Tavily MCP tools are the only search surface —
+#                        web_fetch keeps the preset's own config. on leaves
+#                        the stock preset exactly as it is. Any other value
+#                        warns and falls back to off.
+#
+# Path convention (pi-ai appends): anthropic-messages posts <base>/v1/messages,
+# openai-* posts <base>/chat/completions or <base>/responses, so one endpoint
+# root needs no /v1 for Anthropic and a /v1 for OpenAI — normalized below.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+export DSH_AGENT_ROOT="$ROOT"
+
+echo "Load environment variables ..."
+
+if [ -f "$ROOT/.env" ]; then
+    echo "Loading environment variables from $ROOT/.env ..."
+    set -a
+    source "$ROOT/.env"
+    set +a
+fi
+
+# ── shared helpers ──────────────────────────────────────────────────────────
+die() { echo "dsh-agent: $*" >&2; exit 1; }
+require_var() {
+    local name=$1
+    [ -n "${(P)name}" ] || die "$name is not set. Please set $name in .env file."
+}
+
+# ── dsh home selection ──────────────────────────────────────────────────────
+# A bare first argument names the dsh home: `dsh-agent p` boots $HOME/.dsh-p. The
+# selector is consumed here, so dsh never sees it; a flag-first invocation
+# (`dsh-agent --preset minimal`) selects no home and keeps every existing meaning.
+# Read after .env on purpose: an explicit command-line choice outranks anything
+# the shared file might say, and it also outranks an inherited $DSH_HOME — the
+# harness exports one for every tool shell, so without that rule `dsh-agent p`
+# started from inside a session would silently boot the parent's home.
+HOME_SELECTOR=""
+if [ $# -gt 0 ] && [ -n "$1" ] && [ "${1#-}" = "$1" ]; then
+    case "$1" in
+        .*|*[!A-Za-z0-9._-]*)
+            echo "dsh-agent: invalid home name '$1' (letters, digits, '.', '_', '-' only; no leading dot)" >&2
+            exit 2
+            ;;
+    esac
+    HOME_SELECTOR="$1"
+    shift
+fi
+if [ -n "$HOME_SELECTOR" ]; then
+    DSH_HOME="$HOME/.dsh-$HOME_SELECTOR"
+    export DSH_HOME
+fi
+# Empty for the default home, so the temp files below keep their old names there.
+HOME_TAG="${HOME_SELECTOR:+-$HOME_SELECTOR}"
+
+require_var DDD_BASE_URL
+require_var DDD_AUTH_TOKEN
+require_var DDD_MODEL
+
+DDD_CONTEXT_WINDOW="${DDD_CONTEXT_WINDOW:-1048576}"
+case "$DDD_CONTEXT_WINDOW" in
+    ''|*[!0-9]*)
+        die "DDD_CONTEXT_WINDOW must be a positive integer of tokens (got: $DDD_CONTEXT_WINDOW)."
+        ;;
+esac
+[ "$DDD_CONTEXT_WINDOW" -gt 0 ] \
+    || die "DDD_CONTEXT_WINDOW must be greater than 0 (got: $DDD_CONTEXT_WINDOW)."
+
+DDD_PROTOCOL="${DDD_PROTOCOL:-anthropic-messages}"
+case "$DDD_PROTOCOL" in
+    anthropic-messages|openai-completions|openai-responses) ;;
+    *)
+        die "DDD_PROTOCOL must be anthropic-messages, openai-completions or openai-responses (got: $DDD_PROTOCOL)."
+        ;;
+esac
+
+DDD_BASE_URL="${DDD_BASE_URL%/}"
+if [ "$DDD_PROTOCOL" = "anthropic-messages" ]; then
+    DDD_BASE_URL="${DDD_BASE_URL%/v1}"
+else
+    case "$DDD_BASE_URL" in
+        */v1) ;;
+        *) DDD_BASE_URL="$DDD_BASE_URL/v1" ;;
+    esac
+fi
+export DDD_BASE_URL DDD_AUTH_TOKEN DDD_MODEL DDD_CONTEXT_WINDOW DDD_PROTOCOL
+
+# All telemetry off. DSH_TELEMETRY_DISABLED (any non-empty value) makes
+# app-boot emit a disabled patch for the session-telemetry-otel row; the
+# mode pins a layer that already set DSH_TELEMETRY_MODE; the OTEL_* trio
+# silences any in-process OpenTelemetry SDK on top of that.
+export DSH_TELEMETRY_DISABLED=1
+export DSH_TELEMETRY_MODE=DISABLED
+export OTEL_SDK_DISABLED=true
+export OTEL_TRACES_EXPORTER=none
+export OTEL_METRICS_EXPORTER=none
+export OTEL_LOGS_EXPORTER=none
+
+PROFILE="${DSH_PI_TUI_PROFILE:-pi-tui}"
+if ! command -v dsh >/dev/null 2>&1; then
+    echo "dsh is not on PATH. Install it first:"
+    echo "  npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs @deepseek-ai/dsh@latest"
+    exit 1
+fi
+DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
+if [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
+    echo "dsh profile '$PROFILE' is not installed under $DSH_HOME_DIR. Install dsh-pi-tui first:"
+    echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add @xmoon76/dsh-pi-tui@latest"
+    # `dsh plugin` forwards to pnpm inside the profile directory and exits 127
+    # when pnpm is absent, so name that prerequisite here instead of letting the
+    # install fail on it. Only when pnpm really is missing: a machine that has
+    # pnpm needs no advice.
+    if ! command -v pnpm >/dev/null 2>&1; then
+        echo "pnpm is not on PATH - 'dsh plugin' forwards to pnpm. Install it first:"
+        echo "  npm install -g --allow-scripts=pnpm pnpm"
+    fi
+    exit 1
+fi
+
+# Built-in web_search off, web_fetch kept. Both tools come from ONE preset row
+# (`tool-web`), owned by the AGENT PRESET rather than by this profile's rows:
+# dsh-pi-tui already disables the host-plane row, and the model-facing pair is
+# re-declared inside the active preset. `ctx.tools.restrict()` cannot mask it (a
+# context-global restriction is rejected outright) and a profile patch cannot
+# reach a preset's child rows, so the only seam is the preset's own declaration
+# row: this overlay re-declares `preset-<id>`, and a non-insert entry replaces
+# that row's whole config. The official preset file is a `- insert:` patch list,
+# so the takeover is a derived copy of it lifted to a top-level
+# `- id: preset-<id>` entry whose `tool-web` row keeps the stock config plus
+# `search: false`. Derived on every launch under a fixed name: it can never go
+# stale against a dsh upgrade, and any doubt leaves DERIVED empty so the launch
+# keeps the stock preset.
+DERIVED=""
+DERIVED_CACHED=""
+SRC=""
+PRESET=""
+DSH_BIN=""
+case "${DSA_WEB_SEARCH:-off}" in
+    on) WEB_SEARCH=on ;;
+    off) WEB_SEARCH=off ;;
+    *)
+        echo "DSA_WEB_SEARCH: unknown value '$DSA_WEB_SEARCH' (expected on|off); treating as off." >&2
+        WEB_SEARCH=off
+        ;;
+esac
+if [ "$WEB_SEARCH" = off ]; then
+    DSH_BIN="$(command -v dsh 2>/dev/null || true)"
+    [ -z "$DSH_BIN" ] || DSH_BIN="$(realpath "$DSH_BIN")"
+fi
+if [ -n "${DSH_BIN:-}" ] && [ -x "$DSH_BIN" ]; then
+    # Effective preset: the one the user passes to the app (last wins, so it
+    # matches what dsh-pi-tui will parse), else $DSH_PI_TUI_PRESET, else the
+    # roster default. The launch pins that same value with --preset so the
+    # derived takeover can never land on a different preset than the session
+    # starts on.
+    PRESET_FROM_ARGS=""
+    preset_seen=0
+    preset_next=0
+    for arg in "$@"; do
+        if [ "$preset_next" = 1 ]; then
+            PRESET_FROM_ARGS="$arg"
+            preset_seen=1
+            preset_next=0
+            continue
+        fi
+        case "$arg" in
+            --preset) preset_next=1 ;;
+            --preset=*)
+                PRESET_FROM_ARGS="${arg#--preset=}"
+                preset_seen=1
+                ;;
+        esac
+    done
+    PRESET="$PRESET_FROM_ARGS"
+    [ "$preset_seen" = 1 ] || PRESET="${DSH_PI_TUI_PRESET:-standard}"
+    case "$PRESET" in
+        standard|ptc|minimal|cordis)
+            # Resolve through the dsh installation's own module graph instead
+            # of guessing an install layout.
+            SRC="$(node -e 'const{createRequire}=require("node:module");try{process.stdout.write(createRequire(process.argv[1]).resolve(process.argv[2]))}catch{process.exit(1)}' \
+                "$DSH_BIN" "@deepseek-ai/dsh-web-app/presets/$PRESET.patch.yml" 2>/dev/null)" || SRC=""
+            if [ -n "$SRC" ] && [ -f "$SRC" ]; then
+                DERIVED="${TMPDIR:-/tmp}/dsh-agent-preset-$PRESET$HOME_TAG.yml"
+                # Install-once semantics: the derived block is a pure function of
+                # the official preset file, THIS script and the derivation helper,
+                # so a copy already newer than all three is reused instead of
+                # re-derived. A dsh upgrade (new $SRC mtime), a launcher edit or a
+                # helper edit makes it stale and it is rebuilt; a missing or empty
+                # file is rebuilt too. Nothing is written into the profile, so a
+                # plain `dsh --profile <name>` launch stays untouched.
+                if [ -s "$DERIVED" ] && [ "$DERIVED" -nt "$SRC" ] \
+                   && [ "$DERIVED" -nt "$SCRIPT_DIR/dsh-agent" ] \
+                   && [ "$DERIVED" -nt "$ROOT/assets/dsh-agent-preset.mjs" ]; then
+                    DERIVED_CACHED=1
+                else
+                    DERIVED_CACHED=""
+                    if [ ! -f "$ROOT/assets/dsh-agent-preset.mjs" ]; then
+                        echo "Web search: override skipped (missing helper dsh-agent-preset.mjs)."
+                        DERIVED=""
+                    else
+                        node "$ROOT/assets/dsh-agent-preset.mjs" \
+                            "$DSH_BIN" "$SRC" "$DERIVED" "$PRESET" || DERIVED=""
+                    fi
+                fi
+            else
+                echo "Web search: override skipped (cannot locate the official '$PRESET' preset)."
+            fi
+            ;;
+        *)
+            echo "Web search: override skipped (preset '$PRESET' ships no official patch file)."
+            ;;
+    esac
+fi
+
+# Regenerated on every launch under a fixed, home-scoped name: no accumulation,
+# no cross-home race on one file, and the path stays valid across the TUI's own
+# /update restart (same argv).
+OVERLAY="${TMPDIR:-/tmp}/dsh-agent-overlay$HOME_TAG.yml"
+# Written to a sibling then renamed into place, for the same reason as the
+# derived preset above: a concurrent launch of the SAME home may read this path
+# while it is rewritten, and a reader must never see a truncated overlay.
+OVERLAY_TMP="$OVERLAY.$$"
+{
+cat <<'YAML'
+# Generated by dsh-agent — no secrets, values resolve from the environment at boot.
+# Each row below replaces that entry's whole config for this run only; a
+# plain `dsh --profile pi-tui` launch keeps the profile's own rows untouched.
+
+# The pi-ai multi-provider twin ships dormant with zero routes; declare the
+# endpoint's route. The key name resolves per request from the exported
+# environment (x-api-key for Anthropic, Bearer for OpenAI — the endpoint
+# accepts either against its inbound auth). A hand-declared model without
+# contextWindow would fall back to pi-ai's 262144 default.
+- id: llm-pi-ai
+  config: !!js >-
+    (() => ({ providers: { 'dsa': { displayName: 'DDD Gateway', apiKeyEnv: 'DDD_AUTH_TOKEN', api: process.env.DDD_PROTOCOL, baseURL: process.env.DDD_BASE_URL, models: [{ id: process.env.DDD_MODEL, contextWindow: Number(process.env.DDD_CONTEXT_WINDOW), input: ['text', 'image'] }] } } }))()
+
+# The package inventory rides official DeepSeek requests as diagnostic
+# metadata; pin the TUI's opt-in off against any layer below this overlay.
+- id: plugin-package-inventory-deepseek
+  config:
+    enabled: false
+
+# Harness-level agent-creation fallback: point it at this route so no
+# agent creation can silently fall back to the official API.
+# reasoningEffort stays unmapped: this route's accepted value set is
+# unverified, so the row keeps the schema default.
+- id: agent-default-model
+  config:
+    provider: dsa
+    model: !!js process.env.DDD_MODEL
+
+# MCP: tavily — the global mcpServers entry in ~/.claude.json, re-declared for
+# this profile (the profile itself has no mcp row; dsh-base only ships
+# mcp-resources). Tools register as mcp__tavily__<tool> and join the model
+# tool set automatically. The key lives in .env: only its variable NAME is
+# baked here, resolved at boot like the DDD_* rows above, so this overlay
+# never carries the secret. Tavily is streamable-HTTP only — dsh-mcp-client
+# has no OAuth flow, and `failOnStartupError` defaults to false, so a missing
+# or rejected key costs just this server's tools, not the boot.
+- insert:
+    - id: mcp-tavily
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: streamable-http
+        serverName: tavily
+        url: !!js >-
+          'https://mcp.tavily.com/mcp/?tavilyApiKey=' + (process.env.TAVILY_API_KEY ?? '')
+YAML
+
+# Appended only when the derivation validated: this entry replaces the preset's
+# own declaration row by id, so `web_search` never reaches the model while
+# `web_fetch` keeps the preset's stock config.
+if [ -n "$DERIVED" ]; then
+    printf '\n# ── preset takeover: built-in web_search disabled, web_fetch kept ──\n'
+    printf '# Derived at launch from %s (never stale against a dsh upgrade).\n' "$SRC"
+    cat "$DERIVED"
+fi
+} > "$OVERLAY_TMP" || { echo "Failed to write overlay $OVERLAY"; exit 1; }
+mv "$OVERLAY_TMP" "$OVERLAY" || { echo "Failed to move the overlay into place: $OVERLAY"; exit 1; }
+
+# ── wrong-command guard ─────────────────────────────────────────────────────
+# Prepend wrong-cmd.d to the PATH this process hands to dsh-pi-tui: the bash tool
+# spawns `bash -c` with the parent's environment, so a PATH shim is the only
+# interception that reaches the session's own commands — aliases are not
+# exported and a non-interactive shell never expands them. The guarded set is
+# the wrong-cmd.d listing (one symlink per name — wrong-cmd, or the
+# subcommand-aware wrong-cmd-subcmd for git/npm/pnpm), so
+# changing it is a symlink edit and never a launcher edit. This sits after every
+# pre-flight step that resolves a binary: nothing here may shadow node, sed or
+# dsh itself. The outcome is exported as WRONG_CMD_GUARD_STATE so a session
+# can tell whether it is guarded; a missing guard costs a warning, never the boot.
+GUARD_BIN="$SCRIPT_DIR/wrong-cmd.d"
+guard_names=("$GUARD_BIN"/*(N:t))
+if [ "${DSH_CMD_GUARD:-on}" = "off" ]; then
+    export WRONG_CMD_GUARD_STATE=off
+    echo "Guard: off (DSH_CMD_GUARD=off)"
+elif [ ${#guard_names} -gt 0 ] && [ -x "$SCRIPT_DIR/wrong-cmd" ] \
+     && [ -x "$SCRIPT_DIR/wrong-cmd-subcmd" ]; then
+    # First on PATH, not merely somewhere on it: a real binary ahead of the shim
+    # would win. Drop any earlier copy, then prepend — and never leave a trailing
+    # ':' behind, which would put the current directory on PATH.
+    guard_dirs=(${(s.:.)PATH})
+    guard_dirs=(${guard_dirs:#$GUARD_BIN})
+    guard_tail="${(j.:.)guard_dirs}"
+    PATH="$GUARD_BIN${guard_tail:+:$guard_tail}"
+    export PATH
+    export WRONG_CMD_GUARD_STATE=on
+    printf 'Guard: on — %d guarded name(s): %s (git/npm/pnpm are subcommand-checked)\n' ${#guard_names} "${(j:, :)guard_names}"
+else
+    export WRONG_CMD_GUARD_STATE=unavailable
+    echo "Guard: unavailable (need executable wrong-cmd + wrong-cmd-subcmd and at least one name in wrong-cmd.d) — launching unguarded"
+fi
+
+echo "Profile: $PROFILE"
+echo "Home: $DSH_HOME_DIR"
+echo "Telemetry: disabled (DSH_TELEMETRY_DISABLED=1)"
+echo "Route: dsa/$DDD_MODEL via $DDD_PROTOCOL @ $DDD_BASE_URL (context $DDD_CONTEXT_WINDOW)"
+echo "Overlay: $OVERLAY"
+if [ -n "$DERIVED" ]; then
+    echo "Web search: built-in web_search disabled, web_fetch kept (preset '$PRESET' takeover${DERIVED_CACHED:+, cached})"
+else
+    echo "Web search: stock"
+fi
+
+# --profile/--patch are the dsh launcher flags; everything after them reaches
+# the profile's own app, so --preset and --session are parsed by dsh-pi-tui.
+# --preset is pinned only when the takeover is in effect: it repeats the value
+# already parsed from "$@" (or taken from $DSH_PI_TUI_PRESET / the default), so
+# the session's preset stays identical to the one the derived row was built from.
+SESSION_ARG=()
+[ -n "${DSH_PI_TUI_RESUME_SESSION:-}" ] && SESSION_ARG=(--session "$DSH_PI_TUI_RESUME_SESSION")
+PRESET_ARG=()
+[ -n "$DERIVED" ] && PRESET_ARG=(--preset "$PRESET")
+if [ -n "${DSH_PI_TUI_WORKSPACE_TARGET:-}" ]; then
+    cd "$DSH_PI_TUI_WORKSPACE_TARGET" || {
+        echo "Cannot enter DSH_PI_TUI_WORKSPACE_TARGET: $DSH_PI_TUI_WORKSPACE_TARGET"
+        exit 1
+    }
+fi
+
+# Seed the home's user-global instructions on first use. `$DSH_HOME/AGENTS.md`
+# is the layer dsh reads for every session in that home, and a brand-new home has
+# none — this copies the template tracked in assets/ once. An existing
+# entry of any kind is never touched, not even when the user has rewritten it, so
+# the seed is a first-use default rather than a managed file. Deliberately last:
+# every pre-flight check above has passed and the overlay is already in place, so
+# a launch that fails earlier leaves nothing behind; only a failure of the exec
+# itself can strand the seed.
+if [ "${DSA_SEED_AGENTS:-on}" != "off" ]; then
+    AGENTS_TEMPLATE="$ROOT/assets/global-AGENTS.md"
+    AGENTS_DEST="$DSH_HOME_DIR/AGENTS.md"
+    if [ -e "$AGENTS_DEST" ]; then
+        : # a file, or a link that resolves — leave it exactly as it is
+    elif [ -L "$AGENTS_DEST" ]; then
+        echo "AGENTS.md: WARNING — $AGENTS_DEST is a dangling symlink; no user-global instructions will load." >&2
+    elif [ ! -f "$AGENTS_TEMPLATE" ]; then
+        echo "AGENTS.md: not seeded (no template at $AGENTS_TEMPLATE)" >&2
+    else
+        # Write-then-rename: a half-written AGENTS.md would never be repaired,
+        # because the next launch sees the file and leaves it alone. Two
+        # simultaneous first launches of the same home both write the same
+        # template bytes and the last rename wins, so neither can observe the
+        # other's content and nothing is left behind.
+        seed_tmp="$AGENTS_DEST.dsh-agent-seed.$$"
+        if cp "$AGENTS_TEMPLATE" "$seed_tmp" && mv "$seed_tmp" "$AGENTS_DEST"; then
+            echo "AGENTS.md: seeded $AGENTS_DEST from $AGENTS_TEMPLATE"
+        else
+            echo "AGENTS.md: could not seed $AGENTS_DEST" >&2
+        fi
+    fi
+fi
+
+exec dsh --profile "$PROFILE" --patch "$OVERLAY" "${PRESET_ARG[@]}" "${SESSION_ARG[@]}" "$@"
