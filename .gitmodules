@@ -1,0 +1,20 @@
+[submodule "third-party/ai-bridge"]
+	path = third-party/ai-bridge
+	url = https://github.com/darklinden/ai-bridge.git
+	branch = main
+[submodule "third-party/micro-agent"]
+	path = third-party/micro-agent
+	url = https://github.com/darklinden/micro-agent.git
+	branch = main
+[submodule "third-party/dsh-purge-community"]
+	path = third-party/dsh-purge-community
+	url = https://github.com/darklinden/dsh-purge-community.git
+	branch = main
+[submodule "third-party/dsh-pi-tui"]
+	path = third-party/dsh-pi-tui
+	url = https://github.com/XMoon/dsh-pi-tui.git
+	branch = main
+[submodule "third-party/dsh-blender-plugin"]
+	path = third-party/dsh-blender-plugin
+	url = https://github.com/sixtysevenlf/dsh-blender-plugin.git
+	branch = main
