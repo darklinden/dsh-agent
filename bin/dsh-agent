@@ -15,22 +15,23 @@
 # the dsa route stays registered either way.
 #
 # Home selection: the first argument, when it is a bare name rather than a flag,
-# picks the dsh home — `dsh-agent p` boots $HOME/.dsh-p, `dsh-agent blender-rt`
-# boots $HOME/.dsh-blender-rt, and no argument keeps the home in force. The
-# selector is consumed here and never reaches dsh, so `dsh-agent p --preset
-# minimal` works; a leading '-' (`dsh-agent --preset minimal`) selects nothing.
-# Precedence: the selector > an inherited $DSH_HOME > ~/.dsh. $DSH_HOME is the
-# single root for profiles (each with its own plugin set), sessions, credentials,
-# agent presets, the home-level cordis.patch.yml and the user-global AGENTS.md,
-# so a second home is a second, fully independent suite; $DSH_AGENTS_HOME, a
-# project's own AGENTS.md, the shared .env at the repository root and the wrong-cmd
-# guard stay shared. A home whose profile is missing is reported, never
-# populated: creating it is a one-time, explicit install (the message names the
-# exact command, plus the pnpm install when pnpm is missing from PATH - `dsh
-# plugin` forwards to pnpm and exits 127 without it). A home that boots without
-# an AGENTS.md gets a copy of the template tracked in assets/
-# (global-AGENTS.md) — first use only, never overwriting an existing file;
-# DSA_SEED_AGENTS=off skips that. Seeding runs
+# picks a dsh home under the repository's dsh-home/ root — `dsh-agent p` boots
+# dsh-home/p, `dsh-agent work` boots dsh-home/work, and no argument
+# boots dsh-home/dsh-agent. The selector is consumed here and never reaches dsh,
+# so `dsh-agent p --preset minimal` works; a leading '-' (`dsh-agent --preset
+# minimal`) selects nothing. The home is always repo-local: an inherited
+# $DSH_HOME from the surrounding tool shell is overwritten, so the mapping above
+# holds wherever the launcher is started from. $DSH_HOME is the single root for
+# profiles (each with its own plugin set), sessions, credentials, agent presets,
+# the home-level cordis.patch.yml and the user-global AGENTS.md, so a second
+# home is a second, fully independent suite; $DSH_AGENTS_HOME, a project's own
+# AGENTS.md, the shared .env at the repository root and the wrong-cmd guard stay
+# shared. A home whose profile is missing is reported, never populated: creating
+# it is a one-time, explicit install (the message names the exact command, plus
+# the pnpm install when pnpm is missing from PATH - `dsh plugin` forwards to pnpm
+# and exits 127 without it). A home that boots without an AGENTS.md gets a copy
+# of the template tracked in assets/ (global-AGENTS.md) — first use only, never
+# overwriting an existing file; DSA_SEED_AGENTS=off skips that. Seeding runs
 # last, after every pre-flight check and the overlay swap, so a launch that
 # fails before `exec` leaves nothing behind.
 #
@@ -91,13 +92,10 @@ require_var() {
 }
 
 # ── dsh home selection ──────────────────────────────────────────────────────
-# A bare first argument names the dsh home: `dsh-agent p` boots $HOME/.dsh-p. The
-# selector is consumed here, so dsh never sees it; a flag-first invocation
-# (`dsh-agent --preset minimal`) selects no home and keeps every existing meaning.
-# Read after .env on purpose: an explicit command-line choice outranks anything
-# the shared file might say, and it also outranks an inherited $DSH_HOME — the
-# harness exports one for every tool shell, so without that rule `dsh-agent p`
-# started from inside a session would silently boot the parent's home.
+# A bare first argument names a dsh home under $ROOT/dsh-home: `dsh-agent p`
+# boots dsh-home/p. The selector is consumed here, so dsh never sees it; a
+# flag-first invocation (`dsh-agent --preset minimal`) selects the default home.
+DSH_HOME_ROOT="$ROOT/dsh-home"
 HOME_SELECTOR=""
 if [ $# -gt 0 ] && [ -n "$1" ] && [ "${1#-}" = "$1" ]; then
     case "$1" in
@@ -109,12 +107,14 @@ if [ $# -gt 0 ] && [ -n "$1" ] && [ "${1#-}" = "$1" ]; then
     HOME_SELECTOR="$1"
     shift
 fi
-if [ -n "$HOME_SELECTOR" ]; then
-    DSH_HOME="$HOME/.dsh-$HOME_SELECTOR"
-    export DSH_HOME
-fi
-# Empty for the default home, so the temp files below keep their old names there.
-HOME_TAG="${HOME_SELECTOR:+-$HOME_SELECTOR}"
+HOME_NAME="${HOME_SELECTOR:-dsh-agent}"
+# Set after .env on purpose: neither the shared file nor an inherited $DSH_HOME
+# may move a launch out of the repo-local home this launcher names.
+DSH_HOME="$DSH_HOME_ROOT/$HOME_NAME"
+export DSH_HOME
+# Per-home temp tag: two homes sharing $TMPDIR never collide, and the default
+# home is named like every other one.
+HOME_TAG="-$HOME_NAME"
 
 require_var DDD_BASE_URL
 require_var DDD_AUTH_TOKEN
@@ -165,7 +165,7 @@ if ! command -v dsh >/dev/null 2>&1; then
     echo "  npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs @deepseek-ai/dsh@latest"
     exit 1
 fi
-DSH_HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
+DSH_HOME_DIR="$DSH_HOME"
 if [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
     echo "dsh profile '$PROFILE' is not installed under $DSH_HOME_DIR. Install dsh-pi-tui first:"
     echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add @xmoon76/dsh-pi-tui@latest"

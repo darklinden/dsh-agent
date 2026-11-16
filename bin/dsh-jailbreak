@@ -42,8 +42,9 @@
 # with DSH_JAILBREAK_PLUGIN_SOURCE / DSH_JAILBREAK_PLUGIN_PKG.
 #
 # dsh-jailbreak-only environment variables:
-#   DSH_JAILBREAK_HOME_NAME      optional. dsh home selector handed to dsh-agent
-#                                (default: jailbreak, i.e. ~/.dsh-jailbreak).
+#   DSH_JAILBREAK_HOME_NAME      optional. dsh home name handed to dsh-agent
+#                                (default: dsh-jailbreak, i.e.
+#                                <repo>/dsh-home/dsh-jailbreak).
 #   DSH_JAILBREAK_PLUGIN_SOURCE  optional. Install source for `dsh plugin ... add`
 #                                (default: github:darklinden/dsh-purge-community).
 #                                Point it at a local clone (`.` or an absolute
@@ -59,7 +60,7 @@ BASEDIR=$(dirname "$0")
 SCRIPT_DIR="$(realpath "${BASEDIR}")"
 ROOT="$(dirname "$SCRIPT_DIR")"
 
-JAILBREAK_HOME_NAME="${DSH_JAILBREAK_HOME_NAME:-jailbreak}"
+JAILBREAK_HOME_NAME="${DSH_JAILBREAK_HOME_NAME:-dsh-jailbreak}"
 # Same character set dsh-agent accepts, plus its own rule: the name is handed to
 # dsh-agent as its first argument, so a leading '-' would be read as a flag there
 # and the home this script just installed into would silently not be the home
@@ -70,7 +71,7 @@ case "$JAILBREAK_HOME_NAME" in
         exit 2
         ;;
 esac
-DSH_HOME_DIR="$HOME/.dsh-$JAILBREAK_HOME_NAME"
+DSH_HOME_DIR="$ROOT/dsh-home/$JAILBREAK_HOME_NAME"
 # dsh-agent sources this same .env before it picks the profile, so a
 # DSH_PI_TUI_PROFILE set there would otherwise be missed here — the plugin would
 # be installed into one profile while another one boots, silently without it.

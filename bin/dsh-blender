@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
 
-# dsm — dsh-pi-tui launcher for THIS project: project-local DSH home + the Blender plugin loaded.
+# dsh-blender — dsh-pi-tui launcher for THIS project: repo-local DSH home + the
+# Blender plugin loaded.
 #
 # Modeled on dsh-agent (the global dsh-pi-tui launcher): source a side-by-side
 # .env, export it, then exec `dsh --profile <pi-tui> --patch <generated overlay>`.
@@ -9,18 +10,18 @@
 #
 # Structural differences from dsh-agent:
 #
-#   1. DSH_HOME is this repository's var/home/dsh, so the profile,
-#      sessions, credentials and plugin set of a dsm launch live inside the
-#      project folder and never touch the global ~/.dsh. Unlike dsh-agent's
-#      named homes ($HOME/.dsh-<name>), the home is implied by the repo's
-#      location; there is no home selector argument.
+#   1. DSH_HOME is this repository's dsh-home/dsh-blender, so the profile,
+#      sessions, credentials and plugin set of a dsh-blender launch live inside
+#      the project folder and never touch another home. The home is implied by
+#      the repo's location; there is no home selector argument.
 #   2. The overlay additionally inserts third-party/dsh-blender-plugin as a
 #      profile row, addressed by the module FILE path. The package is therefore
-#      never installed into any profile: the 16 Blender tools exist only in dsm
-#      sessions, and a plain `dsh --profile pi-tui` launch stays as it was.
+#      never installed into any profile: the 16 Blender tools exist only in
+#      dsh-blender sessions, and a plain `dsh --profile pi-tui` launch stays as
+#      it was.
 #   3. The wrong-command guard uses the repository's own bin/ (wrong-cmd,
-#      wrong-cmd-subcmd and wrong-cmd.d), so dsm and dsh-agent guard the
-#      same names; DSM_GUARD_ROOT points it elsewhere.
+#      wrong-cmd-subcmd and wrong-cmd.d), so dsh-blender and dsh-agent guard the
+#      same names; DSH_BLENDER_GUARD_ROOT points it elsewhere.
 #
 # What changed against the previous, dsh-tui build of this launcher:
 #   - the app is dsh-pi-tui, booted through the `dsh` launcher and the profile
@@ -30,7 +31,7 @@
 #   - the dsh-tui-only overlay row (`dsh-tui`: fullscreen / whaleGirl /
 #     companion / statusBar / effort / backend) is gone — those knobs do not
 #     exist in dsh-pi-tui, whose preferences live in its own `tui-app` row and
-#     in-app settings form. dsm deliberately leaves `tui-app` alone: an
+#     in-app settings form. dsh-blender deliberately leaves `tui-app` alone: an
 #     overlay row replaces that entry's WHOLE config, and `tui-app.sessionId`
 #     has no schema default;
 #   - the persisted agent-preset default now lives in the profile's own
@@ -39,15 +40,15 @@
 #     help) are gone with that launcher. Profile maintenance is now
 #     `DSH_HOME=... dsh plugin --profile pi-tui -- <pnpm args>`;
 #   - so is the ~/.dsh-tui onboarding pre-record: dsh-pi-tui ships no such
-#     first-run guide, and nothing under the global ~/.dsh is written by DSH
-#     anymore (the launcher's own scratch files stay in $TMPDIR).
+#     first-run guide, and nothing outside this repository's dsh-home is written
+#     by DSH anymore (the launcher's own scratch files stay in $TMPDIR).
 #
 # Nothing else is shared: dsh-pi-tui keeps its preferences in the profile's own
 # cordis.patch.yml and its sessions under $DSH_HOME/sessions, both rooted in the
 # project home. One thing does stay global, though:
 #   - the plugin's own config: dsh-blender-plugin looks at $DSH_BLENDER_CONFIG →
 #     <package root>/dsh-blender.config.json → os.homedir()/.dsh/… (os.homedir(),
-#     not DSH_HOME). dsm pins $ROOT/dsh-blender.config.json when that file
+#     not DSH_HOME). dsh-blender pins $ROOT/dsh-blender.config.json when that file
 #     exists, so the project copy wins over the global one.
 #
 # .env variables (same names as dsh-agent, so one file can serve both):
@@ -74,7 +75,7 @@
 #   DSH_PI_TUI_PRESET            agent preset when no --preset is passed
 #   DSH_PI_TUI_RESUME_SESSION    forwarded as --session <id>
 #   DSH_PI_TUI_WORKSPACE_TARGET  directory to enter before booting
-#   DSM_GUARD_ROOT               directory holding wrong-cmd, wrong-cmd-subcmd
+#   DSH_BLENDER_GUARD_ROOT       directory holding wrong-cmd, wrong-cmd-subcmd
 #                                and wrong-cmd.d (default: <repo>/bin)
 #   DSH_CMD_GUARD=off            launch without the wrong-command guard
 #
@@ -86,7 +87,7 @@ BASEDIR=$(dirname "$0")
 SCRIPT_DIR="$(realpath "${BASEDIR}")"
 ROOT="$(dirname "$SCRIPT_DIR")"
 # One tag per project: the generated overlay and derived preset are named after
-# this directory, so two dsm projects sharing $TMPDIR cannot collide.
+# this directory, so two dsh-blender checkouts sharing $TMPDIR cannot collide.
 PROJ_TAG="$(printf %s "$ROOT" | cksum | awk '{print $1}')"
 
 echo "Load environment variables ..."
@@ -99,16 +100,16 @@ if [ -f "$ROOT/.env" ]; then
 fi
 
 # ── shared helpers ──────────────────────────────────────────────────────────
-die() { echo "dsm: $*" >&2; exit 1; }
+die() { echo "dsh-blender: $*" >&2; exit 1; }
 require_var() {
     local name=$1
     [ -n "${(P)name}" ] || die "$name is not set. Please set $name in $ROOT/.env."
 }
 
 # Project-local harness home. Set AFTER the .env so this script's choice always
-# wins: profile, sessions, credentials and plugins of a dsm launch are all
-# rooted here, and nothing outside this directory is written by DSH itself.
-DSH_HOME="$ROOT/var/home/dsh"
+# wins: profile, sessions, credentials and plugins of a dsh-blender launch are
+# all rooted here, and nothing outside this directory is written by DSH itself.
+DSH_HOME="$ROOT/dsh-home/dsh-blender"
 export DSH_HOME
 
 require_var DDD_BASE_URL
@@ -306,10 +307,10 @@ if [ -n "${DSH_BIN:-}" ] && [ -x "$DSH_BIN" ]; then
             SRC="$(node -e 'const{createRequire}=require("node:module");try{process.stdout.write(createRequire(process.argv[1]).resolve(process.argv[2]))}catch{process.exit(1)}' \
                 "$DSH_BIN" "@deepseek-ai/dsh-web-app/presets/$PRESET.patch.yml" 2>/dev/null)" || SRC=""
             if [ -n "$SRC" ] && [ -f "$SRC" ]; then
-                DERIVED="${TMPDIR:-/tmp}/dsm-preset-$PRESET-$PROJ_TAG.yml"
+                DERIVED="${TMPDIR:-/tmp}/dsh-blender-preset-$PRESET-$PROJ_TAG.yml"
                 # Verbatim inline copy of dsh-agent's side-by-side helper
-                # dsh-agent-preset.mjs (dsm stays one self-contained file); keep
-                # the two in sync when either side changes.
+                # dsh-agent-preset.mjs (dsh-blender stays one self-contained
+                # file); keep the two in sync when either side changes.
                 node - "$DSH_BIN" "$SRC" "$DERIVED" "$PRESET" <<'JS'
 // Derive the preset takeover from the installed official preset file.
 // argv: node, -, <dsh bin>, <official preset patch>, <derived output>, <preset>
@@ -319,7 +320,7 @@ const yaml = createRequire(process.argv[2])('yaml')
 const srcPath = process.argv[3]
 const outPath = process.argv[4]
 const preset = process.argv[5]
-const die = (code, message) => { console.error('dsm: ' + message); process.exit(code) }
+const die = (code, message) => { console.error('dsh-blender: ' + message); process.exit(code) }
 const jsTag = { tag: 'tag:yaml.org,2002:js', resolve: (value) => ({ __jsExpr: value }) }
 const parse = (text, what) => {
   try {
@@ -430,17 +431,17 @@ JS
     esac
 fi
 
-# Regenerated on every launch under a per-project fixed name: two dsm projects
-# sharing $TMPDIR cannot overwrite each other's overlay, and the path stays
-# valid across the TUI's own /update restart (same argv).
-OVERLAY="${TMPDIR:-/tmp}/dsm-overlay-$PROJ_TAG.yml"
+# Regenerated on every launch under a per-project fixed name: two dsh-blender
+# checkouts sharing $TMPDIR cannot overwrite each other's overlay, and the path
+# stays valid across the TUI's own /update restart (same argv).
+OVERLAY="${TMPDIR:-/tmp}/dsh-blender-overlay-$PROJ_TAG.yml"
 # Written to a sibling then renamed into place, for the same reason as the
 # derived preset above: a concurrent launch of the SAME project may read this
 # path while it is rewritten, and a reader must never see a truncated overlay.
 OVERLAY_TMP="$OVERLAY.$$"
 {
 cat <<'YAML'
-# Generated by dsm — no secrets, values resolve from the environment at boot.
+# Generated by dsh-blender — no secrets, values resolve from the environment at boot.
 # Each row below replaces that entry's whole config for this run only; a
 # plain `dsh --profile pi-tui` launch keeps the profile's own rows untouched.
 
@@ -488,14 +489,15 @@ YAML
 
 # The Blender row is emitted outside the quoted heredoc so the plugin's absolute
 # path is expanded here. It is a FILE-path row on purpose: the package is never
-# installed into a profile, so only dsm sessions carry these tools.
+# installed into a profile, so only dsh-blender sessions carry these tools.
 cat <<YAML
 
 # ── dsh-blender-plugin: 16 model-side Blender tools, loaded from this project ──
 # The row names lib/index.js, not the package dir — ESM rejects a directory
 # import ("Directory import … is not supported"). The package's own
 # cordis.patch.yml carries the same row, but that one only applies when the
-# package is installed as a profile bundle; dsm deliberately skips that install.
+# package is installed as a profile bundle; dsh-blender deliberately skips that
+# install.
 - insert:
     - id: dsh-blender-plugin
       name: '$PLUGIN_ENTRY'
@@ -521,12 +523,13 @@ mv "$OVERLAY_TMP" "$OVERLAY" || { echo "Failed to move the overlay into place: $
 # the wrong-cmd.d listing (one symlink per name — wrong-cmd, or the
 # subcommand-aware wrong-cmd-subcmd for the names linked to it), so changing it
 # is a symlink edit and never a launcher edit. The scripts are this repo's own
-# in DSM_GUARD_ROOT (default <repo>/bin, where dsh-agent keeps them too). This
+# in DSH_BLENDER_GUARD_ROOT (default <repo>/bin, where dsh-agent keeps them
+# too). This
 # sits after every pre-flight step that resolves a binary: nothing here may
 # shadow node, sed or dsh itself. The outcome is exported as
 # WRONG_CMD_GUARD_STATE so a session can tell whether it is guarded; a missing
 # guard costs a warning, never the boot.
-GUARD_ROOT="${DSM_GUARD_ROOT:-$ROOT/bin}"
+GUARD_ROOT="${DSH_BLENDER_GUARD_ROOT:-$ROOT/bin}"
 GUARD_BIN="$GUARD_ROOT/wrong-cmd.d"
 guard_names=("$GUARD_BIN"/*(N:t))
 # Which names are subcommand-checked is a property of the links, not of this
@@ -561,7 +564,7 @@ else
 fi
 
 echo "Profile: $PROFILE"
-echo "DSH home: $DSH_HOME_DIR (project-local)"
+echo "DSH home: $DSH_HOME_DIR (repo-local)"
 echo "Telemetry: disabled (DSH_TELEMETRY_DISABLED=1)"
 echo "Route: dsa/$DDD_MODEL via $DDD_PROTOCOL @ $DDD_BASE_URL (context $DDD_CONTEXT_WINDOW)"
 echo "Blender: $PLUGIN_ENTRY"

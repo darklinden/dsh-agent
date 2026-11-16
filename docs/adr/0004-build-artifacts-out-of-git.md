@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-11-16)
+Accepted (2026-11-16). Amended 2026-11-16: `photocraft-cli` now tracks the latest release
+instead of a pinned version — see "Version selection" below. The `var/home/dsh` creation
+below is superseded by ADR-0008 (`dsh-home/` is the DSH home root now).
 
 ## Context
 
@@ -28,10 +30,18 @@ idempotent `install.sh` at the repository root:
 - create `var/logs/{ai-bridge,ma}` and `var/home/dsh`
 - report whether `bin/` is on `PATH`, without editing shell configuration
 
-The `photocraft-cli` version is pinned by `PHOTOCRAFT_CLI_VERSION` and defaults to
-`0.8.2`, the version the launcher's flags (`--tiff-layers`, `--tga-bits`, …) were written
-against. Upstream is at `v0.23.1`; bumping it is a deliberate change with a smoke test,
-not a side effect of installing.
+The `photocraft-cli` version is **the latest release**, resolved at install time from the
+`/releases/latest` redirect (which avoids the unauthenticated API's 60 requests/h limit).
+`PHOTOCRAFT_CLI_VERSION` still overrides it when a specific version is wanted, but it is
+no longer set by default: pinning made every install lag upstream, and the artifact is
+gitignored anyway, so there is no history to protect.
+
+> Amended 2026-11-16. The original decision pinned `0.8.2`, on the argument that the
+> launcher's flags (`--tiff-layers`, `--tga-bits`, …) were written against it. Those
+> flags are not used anywhere in this repository — the only CLI surface the launcher
+> touches is `mcp`, `--automation-read-root`, `--automation-write-root` and `--version`.
+> A version bump is therefore a smoke test of three arguments, not a compatibility
+> project. `PHOTOCRAFT_CLI_VERSION=0.8.2 ./install.sh` reproduces the old behaviour.
 
 ## Consequences
 

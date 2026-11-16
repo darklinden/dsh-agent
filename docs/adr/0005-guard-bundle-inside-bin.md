@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-11-16)
+Accepted (2026-11-16); the `dsm`/`DSM_GUARD_ROOT` naming is superseded by ADR-0008.
 
 ## Context
 

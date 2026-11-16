@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Idempotent: submodules -> build bin/{ai-bridge,ma} (then cargo clean) ->
-# fetch photocraft-cli -> create var/ -> report PATH status.
+# fetch the latest photocraft-cli -> create var/ and dsh-home/ -> report PATH status.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd "$ROOT"
@@ -20,7 +20,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PHOTOCRAFT_VERSION="${PHOTOCRAFT_CLI_VERSION:-0.8.2}"
+PHOTOCRAFT_VERSION="${PHOTOCRAFT_CLI_VERSION:-}"   # empty => the latest release
+
+# Version selection: an explicit PHOTOCRAFT_CLI_VERSION always wins; otherwise
+# follow the latest release tag. Resolving through the /releases/latest redirect
+# keeps the unauthenticated GitHub API (60 requests/h) out of the install path.
+resolve_photocraft_version() {
+    local final
+    final=$(curl -fsSIL --max-time 25 \
+                --retry 3 --retry-delay 2 --retry-all-errors \
+                -o /dev/null -w '%{url_effective}' \
+                "https://github.com/storytold/photocraft/releases/latest" 2>/dev/null) || return 1
+    case "$final" in
+        */releases/tag/v[0-9]*) printf '%s\n' "${final##*/releases/tag/v}" ;;
+        *) return 1 ;;
+    esac
+}
 
 if [ -f .gitmodules ]; then
     say "initializing submodules"
@@ -42,6 +57,11 @@ build_rust micro-agent ma
 
 install_photocraft() {
     local want="$PHOTOCRAFT_VERSION" have=""
+    if [ -z "$want" ]; then
+        say "resolving the latest photocraft-cli release"
+        want=$(resolve_photocraft_version) \
+            || die "could not resolve the latest photocraft release — set PHOTOCRAFT_CLI_VERSION=x.y.z and re-run"
+    fi
     if [ -x bin/photocraft-cli ]; then
         have=$(bin/photocraft-cli --version 2>/dev/null | awk '{print $2}')
     fi
@@ -52,7 +72,15 @@ install_photocraft() {
     local url="https://github.com/storytold/photocraft/releases/download/v${want}/photocraft-cli-${want}-macos-universal.zip"
     say "fetching photocraft-cli $want"
     tmp=$(mktemp -d)
-    curl -fL --progress-bar "$url" -o "$tmp/pc.zip"
+    # Retries because this is a 60+ MB asset behind a GitHub redirect, and a
+    # single transient reset (e.g. a proxy dropping the TLS connection) would
+    # otherwise fail the whole install after the Rust builds already succeeded.
+    # --retry-all-errors needs curl >= 7.71; without it, curl retries only the
+    # transient classes it knows.
+    curl -fL --progress-bar \
+        --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 \
+        "$url" -o "$tmp/pc.zip" \
+      || die "could not fetch $url — put a photocraft-cli ${want} binary at bin/photocraft-cli and re-run"
     unzip -q "$tmp/pc.zip" -d "$tmp/x"
     local found
     found=$(find "$tmp/x" -type f -name 'photocraft-cli' -perm -u+x | head -1)
@@ -63,7 +91,8 @@ install_photocraft() {
 }
 install_photocraft
 
-mkdir -p var/logs/ai-bridge var/logs/ma var/home/dsh
+mkdir -p var/logs/ai-bridge var/logs/ma dsh-home
+chmod 700 dsh-home
 [ -f .env ] || say "warning: .env missing — cp .env.example .env and fill it in"
 for s in wrong-cmd wrong-cmd-subcmd; do [ -x "bin/$s" ] || die "bin/$s not executable"; done
 [ -n "$(ls -A bin/wrong-cmd.d 2>/dev/null)" ] || die "bin/wrong-cmd.d is empty — guard shims missing"

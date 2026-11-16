@@ -1,5 +1,5 @@
 # dsh-jailbreak — the home-level patch layer for the jailbreak home
-# (~/.dsh-jailbreak/cordis.patch.yml is a symlink to this file).
+# (<repo>/dsh-home/dsh-jailbreak/cordis.patch.yml is a symlink to this file).
 #
 # Why it exists: dsh-purge's runtime prompt rewrite sets the
 # `deployment:persona-suffix` section text to

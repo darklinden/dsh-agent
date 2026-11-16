@@ -36,10 +36,10 @@
 # — the same text the agent's own `pwd` prints — rather than `pwd -P`.
 #
 # dsh-photocraft-only environment variables:
-#   DSP_HOME_NAME        optional. dsh home selector handed to dsh-agent (default:
-#                        photocraft, i.e. ~/.dsh-photocraft). dsh-agent's own `$1`
-#                        selector is not used here: this launcher always boots
-#                        this home.
+#   DSP_HOME_NAME        optional. dsh home name handed to dsh-agent (default:
+#                        dsh-photocraft, i.e. <repo>/dsh-home/dsh-photocraft).
+#                        dsh-agent's own `$1` selector is not used here: this
+#                        launcher always boots this home.
 #   DSP_AUTOMATION_ROOT  optional. Overrides the Photocraft automation root
 #                        (default: $PWD at launch). Set it when the agent's
 #                        Photocraft scope must differ from the directory you
@@ -57,7 +57,7 @@ BASEDIR=$(dirname "$0")
 SCRIPT_DIR="$(realpath "${BASEDIR}")"
 ROOT="$(dirname "$SCRIPT_DIR")"
 
-DSP_HOME_NAME="${DSP_HOME_NAME:-photocraft}"
+DSP_HOME_NAME="${DSP_HOME_NAME:-dsh-photocraft}"
 # Same character set dsh-agent accepts, plus its own rule: the name is handed to
 # dsh-agent as its first argument, so a leading '-' would be read as a flag there
 # and the home this script just installed into would silently not be the home
@@ -68,7 +68,7 @@ case "$DSP_HOME_NAME" in
         exit 2
         ;;
 esac
-DSH_HOME_DIR="$HOME/.dsh-$DSP_HOME_NAME"
+DSH_HOME_DIR="$ROOT/dsh-home/$DSP_HOME_NAME"
 
 # Photocraft automation scope: the directory this launcher was started in,
 # captured before anything below can change directories. $PWD (logical) is

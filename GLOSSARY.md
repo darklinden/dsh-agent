@@ -19,8 +19,12 @@ the guard shims, and the binaries `install.sh` produces. Anything here is execut
 **`assets/`** — tracked support files that scripts *read* but never put on `PATH`:
 presets, patch overlays, and the AGENTS seed template.
 
-**`var/`** — gitignored runtime state: `var/logs/<tool>/` and `var/home/dsh/`. Deleting
-it loses history and local DSH state, never source.
+**`var/`** — gitignored runtime state: `var/logs/<tool>/`. Deleting it loses logs,
+never source.
+
+**`dsh-home/`** — gitignored repo-local root for DSH homes, one subdirectory per
+launcher (`dsh-agent`, `dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`). It may hold
+credentials, sessions, and plugin state, so it is never committed.
 
 **`ROOT`** — the repo root as computed by a script: `dirname "$SCRIPT_DIR"`. Every path
 to `assets/`, `var/`, `third-party/`, or `.env` is expressed through it.
@@ -31,8 +35,8 @@ files are resolved next to the script (`$SCRIPT_DIR/<file>`). Once scripts live 
 which is kept together in `bin/` on purpose (ADR-0005).
 
 **`install.sh`** — the idempotent bootstrap at the repo root. Initialises submodules,
-builds `bin/ai-bridge` and `bin/ma`, fetches `bin/photocraft-cli`, creates `var/`, and
-reports whether `bin/` is on `PATH`. It never edits shell configuration.
+builds `bin/ai-bridge` and `bin/ma`, fetches `bin/photocraft-cli`, creates `var/` and
+`dsh-home/`, and reports whether `bin/` is on `PATH`. It never edits shell configuration.
 
 ## Guard
 
@@ -55,8 +59,9 @@ their paths rewritten.
 ## DSH
 
 **DSH home** — a directory (`$DSH_HOME`) holding one suite's profiles, sessions,
-credentials, and plugins. `dsm` keeps the Blender session's under `var/home/dsh/`; the
-`dsh-agent` family uses `$HOME/.dsh` and `$HOME/.dsh-<name>` instead.
+credentials, and plugins. Every launcher pins one under `dsh-home/<name>/`:
+`dsh-agent` defaults to `dsh-agent`, its optional first argument replaces that name, and
+the front ends pass their own (`dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`).
 
 **profile** — a named plugin set inside a DSH home (`pi-tui`, `dsh-tui`, …). Plugins are
 installed per profile with `dsh plugin --profile <name> -- add <spec>`, which forwards to

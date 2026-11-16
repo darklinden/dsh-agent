@@ -1,9 +1,9 @@
 # dsh-photocraft — the Photocraft MCP row, installed into the dsh-photocraft
-# home's own patch layer (~/.dsh-photocraft/cordis.patch.yml is a symlink to this
-# file), so every profile booted in that home mounts it. Values resolve from the
-# environment at boot: no path and no secret is baked in, and a bare
-# `dsh-agent photocraft` launch without the launcher still works — PHOTOCRAFT_CLI
-# falls back to its default path and DSP_MCP_ROOT to dsh's own cwd.
+# home's own patch layer (<repo>/dsh-home/dsh-photocraft/cordis.patch.yml is a
+# symlink to this file), so every profile booted in that home mounts it. Values
+# resolve from the environment at boot: no path and no secret is baked in, and
+# a bare `dsh-agent dsh-photocraft` launch without the launcher still works —
+# PHOTOCRAFT_CLI falls back to its default path and DSP_MCP_ROOT to dsh's own cwd.
 #
 # MCP rows belong to a patch layer, not to an agent preset: the shipped presets
 # (standard/ptc/minimal/cordis) declare agent-plane plugins only. Tools register

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (2026-11-16)
+Accepted (2026-11-16); DSH home placement is superseded by ADR-0008.
 
 ## Context
 
