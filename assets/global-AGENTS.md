@@ -1,10 +1,12 @@
-## Iron rules
+# Global Agent Rules
+
+## 0. Iron rules
 - THINK IN English, ANSWER IN Chinese.
 - NEVER run `rm` / `del` / `Remove-Item`, or any deletion — always move to trash.
   (authoritative form: A2)
 
 ## A. Hard Gates (absolute, no exceptions)
-- A1 Language: always answer in Chinese (authority for this rule is the Persona section above).
+- A1 Language: always answer in Chinese (authority: section 0 above).
 - A2 Deletion: never execute `rm` / `del` / `Remove-Item` or any delete command; every deletion
   is a move to the real OS trash via its API — never `mv` into a homemade `~/.trash` directory:
   - macOS: `trash <path>`; fallback
@@ -19,16 +21,21 @@
 - A4 Secrets: never view or output any key, password, token, or private data. When unavoidable,
   reference only the environment-variable name.
 - A5 Custom slot: reserved for project-specific global rules that must always be obeyed.
+- A6 Temp files: create task scratch files, downloads, and intermediate output under `tmp/` at the
+  workspace root (`mkdir -p tmp`). Never place them in the system temp area — `/tmp`, `/var/tmp`,
+  `$TMPDIR`, or an OS temp API. `tmp/` must be gitignored; add `/tmp/` to the workspace
+  `.gitignore` if it is missing. If the workspace is unwritable, stop and ask instead of falling
+  back to the system temp area.
 
 ## B. Execution Protocol (self-check before every action)
 - B1 Before acting, print one line: 【Goal】 + 【Minimal file list I intend to read】.
-- B3 Any new read/search must be able to change the current answer. If it cannot, it is
+- B2 Any new read/search must be able to change the current answer. If it cannot, it is
   divergence — forbidden.
-- B4 Stop as soon as the information suffices. No "let me double-check" / "just one quick look"
+- B3 Stop as soon as the information suffices. No "let me double-check" / "just one quick look"
   scope creep.
-- B5 Verification applies only to the conclusion already given; it must not introduce new files
+- B4 Verification applies only to the conclusion already given; it must not introduce new files
   or directories.
-- B6 Explicit divergence blacklist: whole-directory / whole-project `grep` or scan; browsing
+- B5 Explicit divergence blacklist: whole-directory / whole-project `grep` or scan; browsing
   adjacent directories, old snapshots, `.imported` / `backup` files, or unrelated plugins that
   are not the subject of the question; refactoring, optimization, beautification, formatting.
 
@@ -44,7 +51,7 @@
 - D2 Sub-agent review: after finishing a complex feature module, or before delivering to the
   user, call a sub-agent for a read-only review of the delivered code/implementation. Review is
   an authorized action; its read scope is bounded by the deliverable and its direct dependencies
-  and does NOT count as B3/B6 divergence. Simple tasks (config edits, single-point text changes)
+  and does NOT count as B2/B5 divergence. Simple tasks (config edits, single-point text changes)
   are exempt.
 - D3 Verification duty: for time-sensitive, disputed, or latest information, search and verify as
   needed — never conclude from intuition. C1 still wins: when "should I search this time" is

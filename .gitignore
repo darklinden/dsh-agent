@@ -3,6 +3,7 @@
 dsh-blender.config.json
 dsh-home/
 var/
+/tmp/
 backups/
 bin/ai-bridge
 bin/ma
