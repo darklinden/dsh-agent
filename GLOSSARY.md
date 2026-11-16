@@ -17,7 +17,7 @@ pointer.
 the guard shims, and the binaries `install.sh` produces. Anything here is executable.
 
 **`assets/`** — tracked support files that scripts *read* but never put on `PATH`:
-presets, patch overlays, and the AGENTS seed template.
+presets, patch overlays, and the AGENTS template.
 
 **`var/`** — gitignored runtime state: `var/logs/<tool>/`. Deleting it loses logs,
 never source.
@@ -54,7 +54,7 @@ whose target is `../wrong-cmd` or `../wrong-cmd-subcmd`, i.e. the binaries one l
 
 **`GUARD_ROOT`** — the directory that holds `wrong-cmd`, `wrong-cmd-subcmd`, and
 `wrong-cmd.d/`. After migration that is `bin/`, which is also why those three never need
-their paths rewritten.
+their paths rewritten. `DSH_GUARD_ROOT` selects another directory.
 
 ## DSH
 
@@ -63,12 +63,24 @@ credentials, and plugins. Every launcher pins one under `dsh-home/<name>/`:
 `dsh-agent` defaults to `dsh-agent`, its optional first argument replaces that name, and
 the front ends pass their own (`dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`).
 
+**front end** — a `bin/dsh-*` launcher that owns one tool's setup and then
+`exec`s `dsh-agent <home>`; the shared route/guard/AGENTS plumbing lives there.
+
 **profile** — a named plugin set inside a DSH home (`pi-tui`, `dsh-tui`, …). Plugins are
 installed per profile with `dsh plugin --profile <name> -- add <spec>`, which forwards to
 pnpm in the profile directory.
 
+**home layer** — `$DSH_HOME/cordis.patch.yml`, a patch list applied after every
+profile's bundle layer and before `--patch` overlays. Tool-specific rows live here:
+the purge prompt fix, the Photocraft MCP server, the Blender plugin.
+
 **plugin source** — what that `add` installs. Kept in `dsh-jailbreak` as
 `PLUGIN_SOURCE`, defaulting to the fork of the purge plugin (ADR-0007).
 
-**seed** — first-use copy of `assets/global-AGENTS.md` into a new DSH home as its
-`AGENTS.md`. Never overwrites an existing file; `DSA_SEED_AGENTS=off` skips it.
+**AGENTS template** — `assets/global-AGENTS.md`: the one copy of the user-global
+instructions. A DSH home never keeps a copy of its own.
+
+**AGENTS link** — `$DSH_HOME/AGENTS.md` as a symbolic link to the AGENTS template,
+enforced by the launchers on every start. An entry that is not a symlink resolving to the
+template is replaced; differing content is backed up under `backups/agents/` first.
+`DSA_AGENTS_LINK=off` skips enforcement (`DSA_SEED_AGENTS=off` is the legacy spelling).

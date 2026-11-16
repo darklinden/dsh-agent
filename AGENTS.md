@@ -5,7 +5,7 @@ guard, and the support files they read. Layout decisions are recorded as ADRs in
 `docs/adr/`; shared vocabulary lives in `GLOSSARY.md`.
 
 `assets/global-AGENTS.md` is **not** this repo's agent instructions — it is a template
-seeded into other DSH homes. Do not merge the two.
+symlinked into every DSH home on launch. Do not merge the two.
 
 ## Agent skills
 

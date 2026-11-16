@@ -29,11 +29,13 @@
 # shared. A home whose profile is missing is reported, never populated: creating
 # it is a one-time, explicit install (the message names the exact command, plus
 # the pnpm install when pnpm is missing from PATH - `dsh plugin` forwards to pnpm
-# and exits 127 without it). A home that boots without an AGENTS.md gets a copy
-# of the template tracked in assets/ (global-AGENTS.md) — first use only, never
-# overwriting an existing file; DSA_SEED_AGENTS=off skips that. Seeding runs
-# last, after every pre-flight check and the overlay swap, so a launch that
-# fails before `exec` leaves nothing behind.
+# and exits 127 without it). A home's user-global AGENTS.md is a symlink to the
+# template tracked in assets/ (global-AGENTS.md), re-asserted on every launch:
+# anything that is not that symlink is replaced (differing content is backed up
+# under backups/agents/ first). DSA_AGENTS_LINK=off skips that;
+# DSA_SEED_AGENTS=off is its legacy spelling. Linking runs last, after every
+# pre-flight check and the overlay swap, so a launch that fails before `exec`
+# leaves nothing behind.
 #
 # Guard note: just before the exec below, wrong-cmd.d/ is prepended to PATH, so
 # the dangerous command names symlinked there (rm, ssh, …) resolve to wrong-cmd,
@@ -43,6 +45,8 @@
 # without the guard; the guarded set is the wrong-cmd.d listing. The outcome is
 # exported as WRONG_CMD_GUARD_STATE (on / off / unavailable) — deliberately not
 # a DSH_* name: dsh rebuilds that namespace for every tool shell.
+# DSH_GUARD_ROOT selects another directory holding wrong-cmd, wrong-cmd-subcmd
+# and wrong-cmd.d; the default is this launcher's own bin/.
 #
 # .env variables (shared file with ccc; DDD_* for the route, TAVILY_API_KEY
 # for the MCP row):
@@ -353,13 +357,16 @@ mv "$OVERLAY_TMP" "$OVERLAY" || { echo "Failed to move the overlay into place: $
 # pre-flight step that resolves a binary: nothing here may shadow node, sed or
 # dsh itself. The outcome is exported as WRONG_CMD_GUARD_STATE so a session
 # can tell whether it is guarded; a missing guard costs a warning, never the boot.
-GUARD_BIN="$SCRIPT_DIR/wrong-cmd.d"
+# DSH_GUARD_ROOT moves the bundle as a whole (the three entries below stay
+# siblings); unset keeps it in this launcher's bin/.
+GUARD_ROOT="${DSH_GUARD_ROOT:-$SCRIPT_DIR}"
+GUARD_BIN="$GUARD_ROOT/wrong-cmd.d"
 guard_names=("$GUARD_BIN"/*(N:t))
 if [ "${DSH_CMD_GUARD:-on}" = "off" ]; then
     export WRONG_CMD_GUARD_STATE=off
     echo "Guard: off (DSH_CMD_GUARD=off)"
-elif [ ${#guard_names} -gt 0 ] && [ -x "$SCRIPT_DIR/wrong-cmd" ] \
-     && [ -x "$SCRIPT_DIR/wrong-cmd-subcmd" ]; then
+elif [ ${#guard_names} -gt 0 ] && [ -x "$GUARD_ROOT/wrong-cmd" ] \
+     && [ -x "$GUARD_ROOT/wrong-cmd-subcmd" ]; then
     # First on PATH, not merely somewhere on it: a real binary ahead of the shim
     # would win. Drop any earlier copy, then prepend — and never leave a trailing
     # ':' behind, which would put the current directory on PATH.
@@ -402,34 +409,52 @@ if [ -n "${DSH_PI_TUI_WORKSPACE_TARGET:-}" ]; then
     }
 fi
 
-# Seed the home's user-global instructions on first use. `$DSH_HOME/AGENTS.md`
-# is the layer dsh reads for every session in that home, and a brand-new home has
-# none — this copies the template tracked in assets/ once. An existing
-# entry of any kind is never touched, not even when the user has rewritten it, so
-# the seed is a first-use default rather than a managed file. Deliberately last:
-# every pre-flight check above has passed and the overlay is already in place, so
-# a launch that fails earlier leaves nothing behind; only a failure of the exec
-# itself can strand the seed.
-if [ "${DSA_SEED_AGENTS:-on}" != "off" ]; then
+# ── AGENTS.md: symlinked to the tracked template ─────────────────────────────
+# `$DSH_HOME/AGENTS.md` is the layer dsh reads for every session in that home,
+# and the tracked assets/global-AGENTS.md is its only source. Copying it once
+# let a home drift from the template: a home created before a template edit kept
+# the old instructions forever. Enforcement is therefore per launch: a symlink
+# makes the template the single file every home reads, and `ls -l` shows the
+# target. Anything that is not a symlink resolving to the template is replaced
+# (differing content is backed up under backups/agents/ first). Symlinks work
+# across filesystems, so a home on another volume needs no special case.
+# DSA_AGENTS_LINK=off skips the step (DSA_SEED_AGENTS=off is the legacy spelling
+# of the same switch). Deliberately last, like the seed it replaces: every
+# pre-flight check above has passed and the overlay is in place, so a launch
+# that fails earlier leaves nothing behind; only a failure of the exec itself
+# can strand the link.
+#
+# Keep this block here, in the one launcher every front end delegates to.
+if [ "${DSA_AGENTS_LINK:-${DSA_SEED_AGENTS:-on}}" != "off" ]; then
     AGENTS_TEMPLATE="$ROOT/assets/global-AGENTS.md"
     AGENTS_DEST="$DSH_HOME_DIR/AGENTS.md"
-    if [ -e "$AGENTS_DEST" ]; then
-        : # a file, or a link that resolves — leave it exactly as it is
-    elif [ -L "$AGENTS_DEST" ]; then
-        echo "AGENTS.md: WARNING — $AGENTS_DEST is a dangling symlink; no user-global instructions will load." >&2
-    elif [ ! -f "$AGENTS_TEMPLATE" ]; then
-        echo "AGENTS.md: not seeded (no template at $AGENTS_TEMPLATE)" >&2
+    if [ ! -f "$AGENTS_TEMPLATE" ]; then
+        echo "AGENTS.md: WARNING — no template at $AGENTS_TEMPLATE; nothing linked." >&2
+    elif [ -L "$AGENTS_DEST" ] && [ "$AGENTS_DEST" -ef "$AGENTS_TEMPLATE" ]; then
+        : # already a symlink to the template: nothing to do, and no output
+    elif [ -d "$AGENTS_DEST" ] && [ ! -L "$AGENTS_DEST" ]; then
+        echo "AGENTS.md: WARNING — $AGENTS_DEST is a directory; left alone." >&2
     else
-        # Write-then-rename: a half-written AGENTS.md would never be repaired,
-        # because the next launch sees the file and leaves it alone. Two
-        # simultaneous first launches of the same home both write the same
-        # template bytes and the last rename wins, so neither can observe the
-        # other's content and nothing is left behind.
-        seed_tmp="$AGENTS_DEST.dsh-agent-seed.$$"
-        if cp "$AGENTS_TEMPLATE" "$seed_tmp" && mv "$seed_tmp" "$AGENTS_DEST"; then
-            echo "AGENTS.md: seeded $AGENTS_DEST from $AGENTS_TEMPLATE"
+        # Preserve local content that is about to be overwritten. An identical
+        # copy needs no backup: relinking it loses no bytes.
+        agents_backup=""
+        if [ -f "$AGENTS_DEST" ] && ! cmp -s "$AGENTS_DEST" "$AGENTS_TEMPLATE"; then
+            agents_backup_dir="$ROOT/backups/agents"
+            agents_backup="$agents_backup_dir/$(basename "$DSH_HOME_DIR")-AGENTS.md.$(date +%Y%m%dT%H%M%S).$$"
+            if ! { mkdir -p "$agents_backup_dir" && cp "$AGENTS_DEST" "$agents_backup"; }; then
+                agents_backup=""
+                echo "AGENTS.md: WARNING — could not back up $AGENTS_DEST" >&2
+            fi
+        fi
+        # Symlink first, then rename into place: a concurrent launch never sees
+        # a missing or partial AGENTS.md, and the target stays the template path
+        # (so an atomic replacement of the template itself needs no relink).
+        agents_tmp="$DSH_HOME_DIR/.AGENTS.md.dsh-link.$$.${RANDOM}"
+        if ln -s "$AGENTS_TEMPLATE" "$agents_tmp" 2>/dev/null \
+           && mv -f "$agents_tmp" "$AGENTS_DEST"; then
+            echo "AGENTS.md: symlink -> $AGENTS_TEMPLATE${agents_backup:+ (previous content backed up to $agents_backup)}"
         else
-            echo "AGENTS.md: could not seed $AGENTS_DEST" >&2
+            echo "AGENTS.md: WARNING — could not replace $AGENTS_DEST; left as it was." >&2
         fi
     fi
 fi

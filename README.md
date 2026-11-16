@@ -14,7 +14,7 @@ dangerous-command guard. It also carries the support files those launchers read 
 
 ```
 bin/          everything executable and on PATH
-assets/       tracked support files read by scripts (presets, patch overlays, AGENTS seed)
+assets/       tracked support files read by scripts (presets, patch overlays, AGENTS template)
 third-party/  submodules (added in Stage 4; empty until then): ai-bridge, micro-agent,
               dsh-purge-community, dsh-pi-tui, dsh-blender-plugin
 var/          gitignored runtime state: var/logs/<tool>/
@@ -57,10 +57,10 @@ and `git` for the plugin install.
 
 | command | what it does |
 |---|---|
-| `dsh-agent` | a DSH session with its own home, endpoint, preset, guard and seeded `AGENTS.md` |
+| `dsh-agent` | a DSH session with its own home, endpoint, preset, guard and an `AGENTS.md` symlinked to the repo template |
 | `dsh-photocraft` | `dsh-agent` with the Photocraft automation scope |
 | `dsh-jailbreak` | `dsh-agent` with the purge plugin installed into the profile |
-| `dsh-blender` | the Blender plugin session (needs the `dsh-blender-plugin` submodule built) |
+| `dsh-blender` | `dsh-agent` in the Blender home, with the Blender plugin row (needs the `dsh-blender-plugin` submodule built) |
 | `ai-bridge`, `ai-bridge-with-log` | the local model bridge, foreground or logged in the background |
 | `ccc`, `commit` | small helpers |
 | `pull-all`, `push-all` | pull/push this superproject and every submodule, with pointer consistency checks |
@@ -75,8 +75,9 @@ the scripts read, plus the optional switches. Three of them are secrets:
 ## The guard
 
 `dsh-agent` prepends `bin/wrong-cmd.d/` to `PATH` immediately before `exec`;
-`dsh-photocraft` and `dsh-jailbreak` inherit it by exec'ing `dsh-agent`, and
-`dsh-blender` does the same itself through `DSH_BLENDER_GUARD_ROOT` (default `bin/`).
+`dsh-photocraft`, `dsh-jailbreak` and `dsh-blender` inherit it by exec'ing
+`dsh-agent`. `DSH_GUARD_ROOT` selects another guard bundle directory (default
+`bin/`); `DSH_BLENDER_GUARD_ROOT` remains a legacy alias read by `dsh-blender`.
 Every guarded name is a symlink in that directory — `rm`, `ssh`, `dd`, `mkfs`, … resolve
 to `wrong-cmd`, while `git`, `npm`, `pnpm` resolve to `wrong-cmd-subcmd`, which refuses
 the dangerous subcommands and passes everything else through. To guard another command,

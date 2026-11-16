@@ -1,0 +1,19 @@
+# dsh-blender — the Blender plugin row, installed into the dsh-blender home's
+# own patch layer (<repo>/dsh-home/dsh-blender/cordis.patch.yml is a symlink to
+# this file), so every profile booted in that home mounts it.
+#
+# The row names lib/index.js, not the package dir: dsh imports the module by
+# path and ESM rejects a directory import ("Directory import … is not
+# supported"). The package is never installed into a profile, so the Blender
+# tools exist only in dsh-blender sessions and a plain `dsh --profile pi-tui`
+# launch in another home stays as it was.
+#
+# The path is relative to the HOME directory, where this layer is mounted:
+# $DSH_HOME -> dsh-home/dsh-blender, two levels below the repo root. It must be
+# a plain string, not a `!!js` expression: dsh's profile compatibility preflight
+# calls `name.startsWith()` before the patch loader evaluates `!!js`, so a
+# tagged value gets the row disabled instead of resolved.
+- insert:
+    - id: dsh-blender-plugin
+      name: '../../third-party/dsh-blender-plugin/lib/index.js'
+      config: {}
