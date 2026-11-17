@@ -1,0 +1,20 @@
+# dsh-unity — the Unity MCP row, installed into the dsh-unity home's own patch
+# layer (<repo>/dsh-home/dsh-unity/cordis.patch.yml is a symlink to this file),
+# so every profile booted in that home mounts it.
+#
+# Mirrors the tavily row in bin/dsh-agent: the Unity editor bridge is a
+# streamable-HTTP server on the host loopback, and dsh-mcp-client's default
+# `failOnStartupError: false` means an editor that is not running costs these
+# tools only, never the boot. Tools register as mcp__unityMCP__<tool> and join
+# the model tool set automatically.
+#
+# The URL is a literal local endpoint, so unlike the tavily row there is no key
+# and no environment lookup: the value is exactly the server address, never a
+# secret. Change it here if the Unity bridge listens elsewhere.
+- insert:
+    - id: mcp-unity
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        transport: streamable-http
+        serverName: unityMCP
+        url: http://localhost:18080/mcp

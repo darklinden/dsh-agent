@@ -1,0 +1,105 @@
+#!/usr/bin/env zsh
+
+# dsh-unity [app-args...] — dsh-agent in its own dsh home, with the Unity MCP
+# row installed: the Unity editor bridge launcher.
+#
+# A thin front end for `dsh-agent` (see that file for the .env contract, the
+# pinned route, telemetry-off, the web_search takeover, the wrong-cmd guard and
+# the AGENTS.md link). This script does two things and hands over:
+#
+#   1. it makes sure the dsh-unity home has the Unity MCP row installed
+#      (a symlink to assets/dsh-unity.patch.yml), then execs
+#      `dsh-agent dsh-unity`: same argv, one home to the left;
+#   2. it keeps the home name overridable (DSU_HOME_NAME) with the same
+#      character rules dsh-agent accepts, so a typo cannot silently boot a
+#      different home.
+#
+# Why a home layer and not an extra overlay: $DSH_HOME is the single root for
+# profiles, sessions, credentials and patch layers, and
+# `$DSH_HOME/cordis.patch.yml` is the home-level user layer applied to every
+# profile booted in that home. The Unity row therefore belongs to the home that
+# exists to carry it, needs no extension point in `dsh-agent`, and is installed
+# exactly once — a missing link is created, anything already in place is left
+# alone. The link target is tracked in assets/, so editing it takes effect on
+# the next launch, and a real file written in its place (a user's own home
+# layer) is never touched.
+#
+# Unity scope: the row only points at the local bridge (default
+# http://localhost:8080/mcp). dsh-mcp-client reconnects with backoff, so
+# launching before the editor starts is fine: the tools appear once the bridge
+# answers.
+#
+# dsh-unity-only environment variables:
+#   DSU_HOME_NAME  optional. dsh home name handed to dsh-agent (default:
+#                  dsh-unity, i.e. <repo>/dsh-home/dsh-unity). dsh-agent's own
+#                  `$1` selector is not used here: this launcher always boots
+#                  this home.
+#
+# Everything else is dsh-agent's: DDD_* for the route, DSA_WEB_SEARCH,
+# DSH_PI_TUI_PROFILE / _PRESET / _RESUME_SESSION / _WORKSPACE_TARGET,
+# DSH_CMD_GUARD and DSH_GUARD_ROOT.
+#
+# The home is always <repo>/dsh-home/dsh-unity; an inherited $DSH_HOME is
+# overwritten by dsh-agent, so it cannot move this launch elsewhere. A home
+# whose pi-tui profile is missing is reported, never populated.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+DSU_HOME_NAME="${DSU_HOME_NAME:-dsh-unity}"
+# Same character set dsh-agent accepts, plus its own rule: the name is handed to
+# dsh-agent as its first argument, so a leading '-' would be read as a flag there
+# and the home this script just installed into would silently not be the home
+# that boots.
+case "$DSU_HOME_NAME" in
+    .*|-*|*[!A-Za-z0-9._-]*)
+        echo "dsh-unity: invalid DSU_HOME_NAME '$DSU_HOME_NAME' (letters, digits, '.', '_', '-' only; must not start with '.' or '-')" >&2
+        exit 2
+        ;;
+esac
+DSH_HOME_DIR="$ROOT/dsh-home/$DSU_HOME_NAME"
+
+# Install the Unity MCP row into this home's own patch layer, once. A dangling
+# link is NOT "installed": dsh's loader treats the missing file as no overlay at
+# all, so the tools would vanish silently. It is never repointed — it may be the
+# user's own link — only reported.
+PATCH_SRC="$ROOT/assets/dsh-unity.patch.yml"
+HOME_PATCH="$DSH_HOME_DIR/cordis.patch.yml"
+PATCH_STATE=present
+if [ ! -e "$PATCH_SRC" ]; then
+    PATCH_STATE=no-src
+elif [ ! -e "$HOME_PATCH" ] && [ ! -L "$HOME_PATCH" ]; then
+    if mkdir -p "$DSH_HOME_DIR" \
+        && ln -s "$PATCH_SRC" "$HOME_PATCH" \
+        && [ -e "$HOME_PATCH" ]; then
+        PATCH_STATE=installed
+    else
+        PATCH_STATE=missing
+    fi
+elif [ -L "$HOME_PATCH" ] && [ ! -e "$HOME_PATCH" ]; then
+    PATCH_STATE=dangling
+elif [ "$(realpath "$HOME_PATCH" 2>/dev/null)" != "$(realpath "$PATCH_SRC" 2>/dev/null)" ]; then
+    PATCH_STATE=foreign
+fi
+
+case "$PATCH_STATE" in
+    installed) echo "Unity: MCP row installed -> $HOME_PATCH" ;;
+    present)   echo "Unity: MCP row present -> $HOME_PATCH" ;;
+    dangling)  echo "Unity: WARNING — $HOME_PATCH is a dangling symlink; the MCP row will not load." >&2 ;;
+    foreign)   echo "Unity: WARNING — $HOME_PATCH is not this launcher's layer; unless it carries the Unity MCP row, those tools will not load." >&2 ;;
+    no-src)    echo "Unity: WARNING — $PATCH_SRC is missing, so the MCP row cannot be installed." >&2 ;;
+    missing)   echo "Unity: WARNING — could not create $HOME_PATCH; continuing without the row." >&2 ;;
+esac
+
+# Profile pre-flight: dsh-agent is the one place that reports (and refuses to
+# populate) a missing profile; point at the exact install command here too, since
+# this launcher is the first thing a new home is booted with. The name is read
+# from the same variable dsh-agent uses, so DSH_PI_TUI_PROFILE stays honoured.
+PROFILE="${DSH_PI_TUI_PROFILE:-pi-tui}"
+if [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
+    echo "dsh-unity: profile '$PROFILE' is not installed under $DSH_HOME_DIR. Install dsh-pi-tui first:"
+    echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add @xmoon76/dsh-pi-tui@latest"
+fi
+
+exec "$SCRIPT_DIR/dsh-agent" "$DSU_HOME_NAME" "$@"
