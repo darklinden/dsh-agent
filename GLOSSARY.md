@@ -56,6 +56,13 @@ whose target is `../wrong-cmd` or `../wrong-cmd-subcmd`, i.e. the binaries one l
 `wrong-cmd.d/`. After migration that is `bin/`, which is also why those three never need
 their paths rewritten. `DSH_GUARD_ROOT` selects another directory.
 
+## Trash
+
+**`trash`** — `bin/trash`, the suite's one move-to-real-OS-trash command. It dispatches
+to Finder or a real `trash` binary on macOS, `gio trash` / `trash-cli` or the freedesktop
+XDG Trash on Linux, and the Windows Recycle Bin for `/mnt/<drive>` paths under WSL;
+Linux-side WSL files use XDG Trash. It never creates a homemade `~/.trash`.
+
 ## DSH
 
 **DSH home** — a directory (`$DSH_HOME`) holding one suite's profiles, sessions,

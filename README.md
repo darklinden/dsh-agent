@@ -64,6 +64,7 @@ and `git` for the plugin install.
 | `ai-bridge`, `ai-bridge-with-log` | the local model bridge, foreground or logged in the background |
 | `ccc`, `commit` | small helpers |
 | `pull-all`, `push-all` | pull/push this superproject and every submodule, with pointer consistency checks |
+| `trash` | move files/directories to the real OS trash (macOS, Linux, WSL) |
 | `wrong-cmd`, `wrong-cmd-subcmd`, `wrong-cmd.d/` | the guard (see below) |
 
 ## Configuration
@@ -83,6 +84,16 @@ to `wrong-cmd`, while `git`, `npm`, `pnpm` resolve to `wrong-cmd-subcmd`, which 
 the dangerous subcommands and passes everything else through. To guard another command,
 add a symlink to the directory; the listing is the guarded set. Scope is `PATH`
 resolution only.
+
+## Trash
+
+`bin/trash` is the suite's cross-platform deletion path. It never invents a
+`~/.trash`: macOS uses Finder (or a real `trash` binary when installed), Linux
+uses `gio trash` / `trash-cli` and falls back to the freedesktop XDG Trash, and
+WSL sends `/mnt/<drive>` paths to the Windows Recycle Bin while keeping Linux-side
+files in the XDG Trash. It accepts one or more paths, refuses `/` and drive/mount
+roots, and never overwrites an existing trash entry. On success it logs
+`trash <path> => <trash location>` to stderr.
 
 ## License
 

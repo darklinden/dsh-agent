@@ -56,7 +56,8 @@ PATH to get around this: that is the same wrong command.
 
 If the action is genuinely needed, use the supported route instead:
   * deleting a file or directory: check the resolved absolute target, then
-    move it to the OS trash (macOS: trash <abs path>);
+    run `trash <abs path>` (the suite's cross-platform wrapper; if bin/ is
+    not on PATH, run the repo's bin/trash);
   * ending a process or truncating a file: confirm with the user first;
   * remote shell, privilege or disk-level operations: ask the user to run it.
 EOF

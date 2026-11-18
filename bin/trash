@@ -1,0 +1,502 @@
+#!/bin/sh
+
+# trash — move files and directories to the real OS trash.
+#
+# Why this exists: the dsh guard forbids rm, and WSL ships neither `trash` nor
+# `gio trash`. This is the one deletion path the suite's AGENTS template names,
+# so it must work on macOS, Linux and WSL without asking the user to install a
+# trash-cli package first.
+#
+# Backends, in order:
+#   macOS       a real `trash` on PATH (self excluded), else Finder via osascript
+#   WSL /mnt/X  Windows Recycle Bin via powershell.exe + Microsoft.VisualBasic
+#   Linux       a real `trash` on PATH, `gio trash`, `trash-put`, then XDG Trash
+#
+# The XDG fallback follows the FreeDesktop Trash specification for the common
+# case: home trash when the target is on the same filesystem, and
+# $topdir/.Trash/$uid or $topdir/.Trash-$uid otherwise. It moves the item into
+# the selected trash and writes the Path= / DeletionDate= metadata.
+#
+# Safety: paths are resolved to absolute paths (the final symlink is not
+# followed), `/` and drive/mount roots are refused, and an existing trash entry
+# is never overwritten. Success prints one log line to stderr; failures also go
+# to stderr and exit 1. There is no `rm` anywhere in this file.
+
+set -u
+
+# A second copy of this script on PATH must not bounce a call back and forth.
+# The real backend is invoked with this set; a nested copy then skips the PATH
+# scan and uses its platform fallback instead of delegating again.
+delegating=${DSH_TRASH_DELEGATING:-0}
+
+usage() {
+    cat <<'EOF'
+Usage: trash [--] PATH...
+
+Move files and directories to the real OS trash.
+
+Backends:
+  macOS  a real `trash` binary when installed, otherwise Finder via osascript
+  Linux  a real `trash`, `gio trash`, `trash-put`, or the XDG Trash fallback
+  WSL    Windows Recycle Bin for /mnt/<drive> paths; XDG Trash for Linux files
+
+Options:
+  -h, --help   show this help and exit
+  --           treat every remaining argument as a path
+
+On success prints one line to stderr: trash <path> => <trash location>.
+A path that cannot be trashed is reported on stderr; the command exits 1 if
+any path failed and 2 on a usage error.
+EOF
+}
+
+err() {
+    printf 'trash: %s\n' "$*" >&2
+}
+
+log_trash() {
+    printf 'trash %s => %s\n' "$1" "$2" >&2
+}
+
+# Resolve this script so the PATH scan below can exclude it. A bare `$0`
+# (`trash`, as a shell usually passes it) is resolved through PATH.
+self=$0
+case $self in
+    */*) ;;
+    *) self=$(command -v "$self" 2>/dev/null || true) ;;
+esac
+if [ -n "$self" ]; then
+    _self_dir=$(dirname "$self")
+    if _self_dir=$(CDPATH= cd -P "$_self_dir" 2>/dev/null && pwd -P); then
+        self=$_self_dir/$(basename "$self")
+    fi
+fi
+
+# First executable called $1 on PATH that is not this script. -ef compares
+# device and inode, so a symlink back to this file is rejected as well.
+find_real() {
+    [ "$delegating" = 1 ] && return 1
+    _fr_name=$1
+    _fr_old_ifs=$IFS
+    IFS=:
+    for _fr_dir in $PATH; do
+        [ -n "$_fr_dir" ] || _fr_dir=.
+        _fr_cand=${_fr_dir%/}/$_fr_name
+        [ -f "$_fr_cand" ] && [ -x "$_fr_cand" ] || continue
+        [ "$_fr_cand" -ef "$self" ] && continue
+        printf '%s\n' "$_fr_cand"
+        IFS=$_fr_old_ifs
+        return 0
+    done
+    IFS=$_fr_old_ifs
+    return 1
+}
+
+is_wsl() {
+    [ -n "${WSL_DISTRO_NAME:-}" ] && return 0
+    [ -r /proc/version ] || return 1
+    grep -qi microsoft /proc/version 2>/dev/null
+}
+
+is_windows_mount() {
+    case $1 in
+        /mnt/[A-Za-z]/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Mount point of the filesystem containing $1. GNU stat is exact and available
+# on Linux/WSL; df -P is the portable fallback (macOS). The comparison in
+# trash_one only refuses an argument that IS the mount point, not a file on it.
+mount_point() {
+    _mp_path=$1
+    _mp=$(stat -c %m "$_mp_path" 2>/dev/null) || _mp=
+    if [ -z "$_mp" ]; then
+        _mp=$(df -P "$_mp_path" 2>/dev/null | awk 'NR==2 { $1=$2=$3=$4=$5=""; sub(/^[ \t]+/, ""); print }')
+    fi
+    _mp=${_mp%/}
+    [ -n "$_mp" ] || _mp=/
+    printf '%s\n' "$_mp"
+}
+
+# Absolute path with the parent canonicalised, but the final component left
+# alone: a symlink argument must be trashed as a link, not as its target.
+abs_path() {
+    _a_in=$1
+    [ -n "$_a_in" ] || return 1
+    case $_a_in in
+        /*) _a_path=$_a_in ;;
+        *) _a_path=$PWD/$_a_in ;;
+    esac
+    while :; do
+        case $_a_path in
+            */) _a_path=${_a_path%/} ;;
+            *) break ;;
+        esac
+    done
+    [ -n "$_a_path" ] || _a_path=/
+    if [ "$_a_path" = / ]; then
+        printf '/\n'
+        return 0
+    fi
+    _a_base=$(basename "$_a_path")
+    case $_a_base in
+        .|..) return 1 ;;
+    esac
+    _a_parent=$(dirname "$_a_path")
+    _a_parent=$(CDPATH= cd -P "$_a_parent" 2>/dev/null && pwd -P) || return 1
+    case $_a_parent in
+        /) printf '/%s\n' "$_a_base" ;;
+        *) printf '%s/%s\n' "$_a_parent" "$_a_base" ;;
+    esac
+}
+
+# Percent-encode a path for the .trashinfo Path= key. `/` stays a separator;
+# every other byte outside the RFC 3986 unreserved set becomes %XX. od is used
+# instead of a Python/Perl dependency because it is in POSIX.
+urlencode() {
+    LC_ALL=C
+    printf '%s' "$1" | od -An -tu1 -v | tr -s ' ' '\n' | while IFS= read -r _u_byte; do
+        [ -n "$_u_byte" ] || continue
+        _u_safe=
+        case $_u_byte in
+            45|46|47|95|126) _u_safe=1 ;;
+            4[89]|5[0-7]) _u_safe=1 ;;
+            6[5-9]|7[0-9]|8[0-9]|90) _u_safe=1 ;;
+            9[7-9]|10[0-9]|11[0-9]|12[0-2]) _u_safe=1 ;;
+        esac
+        if [ -n "$_u_safe" ]; then
+            printf "\\$(printf '%03o' "$_u_byte")"
+        else
+            printf '%%%02X' "$_u_byte"
+        fi
+    done
+}
+
+ensure_trash_dirs() {
+    _e_trash=$1
+    [ -d "$_e_trash/files" ] || mkdir -p "$_e_trash/files" || return 1
+    [ -d "$_e_trash/info" ] || mkdir -p "$_e_trash/info" || return 1
+    chmod 700 "$_e_trash" "$_e_trash/files" "$_e_trash/info" 2>/dev/null || true
+    return 0
+}
+
+# Best-effort destination for backends that do not report the exact entry they
+# created (gio, trash-put, a real trash binary). The XDG fallback overrides
+# this with the exact files/<name> path.
+default_trash_dir() {
+    _dt_data=${XDG_DATA_HOME:-}
+    if [ -z "$_dt_data" ]; then
+        [ -n "${HOME:-}" ] || return 1
+        _dt_data=$HOME/.local/share
+    fi
+    printf '%s/Trash\n' "$_dt_data"
+}
+
+xdg_trash() {
+    _x_abs=$1
+    trash_error=
+
+    _x_data=${XDG_DATA_HOME:-}
+    if [ -z "$_x_data" ]; then
+        if [ -z "${HOME:-}" ]; then
+            trash_error='no XDG_DATA_HOME or HOME for the XDG Trash fallback'
+            return 1
+        fi
+        _x_data=$HOME/.local/share
+    fi
+
+    # Find the nearest existing ancestor so the device check works on a fresh
+    # account where ~/.local/share does not exist yet.
+    _x_probe=$_x_data
+    while [ ! -d "$_x_probe" ]; do
+        _x_up=$(dirname "$_x_probe")
+        [ "$_x_up" = "$_x_probe" ] && break
+        _x_probe=$_x_up
+    done
+    _x_home_dev=$(stat -c %d "$_x_probe" 2>/dev/null) || {
+        trash_error='cannot determine the filesystem of the home trash'
+        return 1
+    }
+    _x_parent=$(dirname "$_x_abs")
+    _x_target_dev=$(stat -c %d "$_x_parent" 2>/dev/null) || {
+        trash_error='cannot determine the filesystem of the target'
+        return 1
+    }
+
+    if [ "$_x_home_dev" = "$_x_target_dev" ]; then
+        _x_trash=$_x_data/Trash
+        _x_relpath=$_x_abs
+    else
+        _x_top=$(stat -c %m "$_x_parent" 2>/dev/null) || {
+            trash_error='cannot determine the mount point of the target'
+            return 1
+        }
+        [ -n "$_x_top" ] || {
+            trash_error='empty mount point for the target'
+            return 1
+        }
+        _x_top=${_x_top%/}
+        [ -n "$_x_top" ] || _x_top=/
+        [ "$_x_abs" = "$_x_top" ] && {
+            trash_error='refusing to trash a mount point'
+            return 1
+        }
+        if [ "$_x_top" = / ]; then
+            _x_relpath=${_x_abs#/}
+        else
+            _x_relpath=${_x_abs#"$_x_top"/}
+            [ "$_x_relpath" = "$_x_abs" ] && {
+                trash_error='target is not under its mount point'
+                return 1
+            }
+        fi
+        if [ -d "$_x_top/.Trash" ] && [ -k "$_x_top/.Trash" ] && [ -w "$_x_top/.Trash" ]; then
+            _x_trash=$_x_top/.Trash/$(id -u)
+        else
+            _x_trash=$_x_top/.Trash-$(id -u)
+        fi
+    fi
+
+    ensure_trash_dirs "$_x_trash" || {
+        trash_error="cannot create trash directories under $_x_trash"
+        return 1
+    }
+
+    _x_base=$(basename "$_x_abs")
+    _x_name=$_x_base
+    _x_n=1
+    while [ -e "$_x_trash/files/$_x_name" ] || [ -L "$_x_trash/files/$_x_name" ] \
+          || [ -e "$_x_trash/info/$_x_name.trashinfo" ] \
+          || [ -L "$_x_trash/info/$_x_name.trashinfo" ]; do
+        _x_name=$_x_base.$_x_n
+        _x_n=$((_x_n + 1))
+        [ "$_x_n" -gt 9999 ] && {
+            trash_error="too many existing trash entries named $_x_base"
+            return 1
+        }
+    done
+
+    if ! mv "$_x_abs" "$_x_trash/files/$_x_name"; then
+        if [ -e "$_x_abs" ] || [ -L "$_x_abs" ]; then
+            trash_error="cannot move the target into $_x_trash/files"
+            return 1
+        fi
+    fi
+    if [ -e "$_x_abs" ] || [ -L "$_x_abs" ]; then
+        trash_error='the target still exists after the move'
+        return 1
+    fi
+    if [ ! -e "$_x_trash/files/$_x_name" ] && [ ! -L "$_x_trash/files/$_x_name" ]; then
+        trash_error="the target is gone but not present at $_x_trash/files/$_x_name"
+        return 1
+    fi
+    trash_dest="$_x_trash/files/$_x_name"
+
+    _x_enc=$(urlencode "$_x_relpath")
+    _x_date=$(date +%Y-%m-%dT%H:%M:%S)
+    if ! {
+        printf '[Trash Info]\n'
+        printf 'Path=%s\n' "$_x_enc"
+        printf 'DeletionDate=%s\n' "$_x_date"
+    } > "$_x_trash/info/$_x_name.trashinfo"; then
+        if mv "$_x_trash/files/$_x_name" "$_x_abs" 2>/dev/null; then
+            trash_error='cannot write trash metadata; the target was moved back'
+        else
+            trash_error="cannot write trash metadata; the target is at $_x_trash/files/$_x_name"
+        fi
+        return 1
+    fi
+    return 0
+}
+
+mac_trash() {
+    _m_abs=$1
+    trash_error=
+    trash_dest="${HOME:-~}/.Trash"
+    _m_real=$(find_real trash) || _m_real=
+    if [ -n "$_m_real" ]; then
+        DSH_TRASH_DELEGATING=1 "$_m_real" "$_m_abs" >/dev/null 2>&1
+        [ ! -e "$_m_abs" ] && [ ! -L "$_m_abs" ] && return 0
+    fi
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e 'on run argv' \
+            -e 'tell application "Finder" to delete ((item 1 of argv) as POSIX file)' \
+            -e 'end run' "$_m_abs" >/dev/null 2>&1
+        [ ! -e "$_m_abs" ] && [ ! -L "$_m_abs" ] && return 0
+    fi
+    trash_error='Finder/osascript could not move the target to the Trash'
+    return 1
+}
+
+powershell_trash() {
+    _w_abs=$1
+    trash_error=
+    command -v wslpath >/dev/null 2>&1 || {
+        trash_error='wslpath is not available'
+        return 1
+    }
+    command -v powershell.exe >/dev/null 2>&1 || {
+        trash_error='powershell.exe is not available (WSL interop disabled?)'
+        return 1
+    }
+    _w_win=$(wslpath -w "$_w_abs" 2>/dev/null) || {
+        trash_error='wslpath could not translate the target'
+        return 1
+    }
+    case $_w_win in
+        [A-Za-z]:\\*) ;;
+        *)
+            trash_error="not a local Windows drive path: $_w_win"
+            return 1
+            ;;
+    esac
+    _w_drive=${_w_win%%:*}
+    trash_dest="${_w_drive}:\\\$Recycle.Bin"
+
+    # WSLENV is the supported way to hand a value to a Windows process. The
+    # path travels as data, never as part of the PowerShell source, so spaces,
+    # quotes and backslashes need no escaping.
+    WSLENV=TRASH_TARGET TRASH_TARGET="$_w_win" \
+        powershell.exe -NoProfile -NonInteractive -Command '
+            $ErrorActionPreference = "Stop"
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            $p = $env:TRASH_TARGET
+            if ([System.IO.Directory]::Exists($p)) {
+                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+                    $p,
+                    [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                    [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,
+                    [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+            } elseif ([System.IO.File]::Exists($p)) {
+                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+                    $p,
+                    [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                    [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin,
+                    [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+            } else {
+                throw "target not found: $p"
+            }
+        ' >/dev/null 2>&1
+    [ ! -e "$_w_abs" ] && [ ! -L "$_w_abs" ] && return 0
+    trash_error='Windows Recycle Bin rejected the target (local drive, interop and bin enabled?)'
+    return 1
+}
+
+linux_trash() {
+    _l_abs=$1
+    trash_error=
+    trash_dest=$(default_trash_dir 2>/dev/null) || trash_dest='OS trash'
+    if is_wsl && is_windows_mount "$_l_abs"; then
+        powershell_trash "$_l_abs" && return 0
+        [ ! -e "$_l_abs" ] && [ ! -L "$_l_abs" ] && return 0
+        return 1
+    fi
+
+    _l_real=$(find_real trash) || _l_real=
+    if [ -n "$_l_real" ]; then
+        DSH_TRASH_DELEGATING=1 "$_l_real" "$_l_abs" >/dev/null 2>&1
+        [ ! -e "$_l_abs" ] && [ ! -L "$_l_abs" ] && return 0
+    fi
+    if command -v gio >/dev/null 2>&1; then
+        gio trash "$_l_abs" >/dev/null 2>&1
+        [ ! -e "$_l_abs" ] && [ ! -L "$_l_abs" ] && return 0
+    fi
+    if command -v trash-put >/dev/null 2>&1; then
+        trash-put "$_l_abs" >/dev/null 2>&1
+        [ ! -e "$_l_abs" ] && [ ! -L "$_l_abs" ] && return 0
+    fi
+    xdg_trash "$_l_abs"
+}
+
+trash_one() {
+    _t_arg=$1
+    trash_error=
+    trash_dest=
+    _t_abs=$(abs_path "$_t_arg") || {
+        err "$_t_arg: invalid path (empty, '.', '..' or unreadable parent)"
+        return 1
+    }
+    case $_t_abs in
+        /)
+            err 'refusing to trash /'
+            return 1
+            ;;
+        /mnt/[A-Za-z])
+            err "$_t_abs: refusing to trash a Windows drive root"
+            return 1
+            ;;
+    esac
+    _t_mp=$(mount_point "$_t_abs")
+    if [ -n "$_t_mp" ] && [ "$_t_mp" = "$_t_abs" ]; then
+        err "$_t_abs: refusing to trash a mount point"
+        return 1
+    fi
+    if [ ! -e "$_t_abs" ] && [ ! -L "$_t_abs" ]; then
+        err "$_t_arg: no such file or directory"
+        return 1
+    fi
+
+    case $(uname -s 2>/dev/null) in
+        Darwin) mac_trash "$_t_abs" ;;
+        Linux) linux_trash "$_t_abs" ;;
+        *) xdg_trash "$_t_abs" ;;
+    esac
+    _t_rc=$?
+    if [ -e "$_t_abs" ] || [ -L "$_t_abs" ]; then
+        if [ "$_t_rc" -ne 0 ]; then
+            if [ -n "$trash_error" ]; then
+                err "$_t_arg: $trash_error"
+            else
+                err "$_t_arg: could not move to the trash"
+            fi
+        else
+            err "$_t_arg: backend reported success but the target still exists"
+        fi
+        return 1
+    fi
+    if [ -z "${trash_dest:-}" ]; then
+        trash_dest='OS trash'
+    fi
+    log_trash "$_t_arg" "$trash_dest"
+    return 0
+}
+
+# Validate options before touching anything, so `trash good --bad` cannot trash
+# the first argument and then fail on the second.
+_status=0
+_seen_ddash=0
+for _arg in "$@"; do
+    if [ "$_seen_ddash" -eq 0 ]; then
+        case $_arg in
+            --) _seen_ddash=1 ;;
+            -h|--help) usage; exit 0 ;;
+            -?*)
+                err "unknown option: $_arg"
+                usage >&2
+                exit 2
+                ;;
+        esac
+    fi
+done
+
+_count=0
+_seen_ddash=0
+for _arg in "$@"; do
+    if [ "$_seen_ddash" -eq 0 ]; then
+        case $_arg in
+            --)
+                _seen_ddash=1
+                continue
+                ;;
+        esac
+    fi
+    _count=$((_count + 1))
+    trash_one "$_arg" || _status=1
+done
+
+if [ "$_count" -eq 0 ]; then
+    usage >&2
+    exit 2
+fi
+exit "$_status"

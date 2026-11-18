@@ -9,12 +9,15 @@
 - A1 Language: always answer in Chinese (authority: section 0 above).
 - A2 Deletion: never execute `rm` / `del` / `Remove-Item` or any delete command; every deletion
   is a move to the real OS trash via its API — never `mv` into a homemade `~/.trash` directory:
-  - macOS: `trash <path>`; fallback
-    `osascript -e 'tell application "Finder" to delete POSIX file "/abs/path"'`
-  - Windows (PowerShell, built-in): `Add-Type -AssemblyName Microsoft.VisualBasic;`
+  - macOS / Linux / WSL: `trash <path>` (the suite's `bin/trash`; use
+    `"$DSH_AGENT_ROOT/bin/trash"` if `bin/` is not on PATH). It uses Finder or a real
+    `trash` binary on macOS, `gio trash` / `trash-put` / the freedesktop XDG Trash on Linux,
+    the Windows Recycle Bin for `/mnt/<drive>` paths under WSL, and XDG Trash for Linux files.
+  - macOS fallback: `osascript -e 'tell application "Finder" to delete POSIX file "/abs/path"'`.
+  - Linux fallback: `gio trash <path>`, or `trash-put <path>` (trash-cli).
+  - native Windows (PowerShell, built-in): `Add-Type -AssemblyName Microsoft.VisualBasic;`
     `[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin')`
     — directories use `DeleteDirectory`; local volumes only (network paths throw).
-  - Linux: `gio trash <path>`, or `trash-put <path>` (trash-cli).
   Inspect soft / hard / symbolic links before touching them.
 - A3 Write intent: without an explicit write intent, do not write, create, or modify any file.
   (Exceptions: backup files and temporary test scripts.)
