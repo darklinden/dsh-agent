@@ -1,5 +1,8 @@
 .DS_Store
 .env
+# pnpm's per-project content store: a regenerable cache that lands at the repo
+# root whenever `dsh plugin` installs from here.
+.pnpm-store/
 dsh-blender.config.json
 dsh-home/
 var/

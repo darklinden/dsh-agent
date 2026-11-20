@@ -3,6 +3,11 @@
 # dsh-agent [home-name] [app-args...] — dsh-pi-tui launcher: endpoint declared in
 # .env, all telemetry off.
 #
+# Permission rules (ADR-0011): the launcher installs the dsh-permission-rules
+# plugin into the profile on first use and mounts assets/permission-rules.patch.yml
+# as a second --patch overlay. DSH_PERMISSION_RULES=off skips it; a missing
+# plugin or a failed install costs a warning, never the boot.
+#
 # Modeled on ccc: source a side-by-side .env and export it. Unlike ccc, which
 # runs its CLI as a child, this launcher `exec`s it, so signals and the exit
 # code pass straight through.
@@ -69,6 +74,26 @@
 #                        web_fetch keeps the preset's own config. on leaves
 #                        the stock preset exactly as it is. Any other value
 #                        warns and falls back to off.
+#   DSH_PERMISSION_RULES optional. on (default) mounts assets/permission-rules.patch.yml
+#                        as a second --patch overlay: the declarative deny/ask rule
+#                        table of the dsh-permission-rules plugin. off launches
+#                        without it. The plugin is installed into the profile on
+#                        first use and the rules stay a tracked asset, so the
+#                        policy is reviewable without republishing the plugin.
+#   DSH_PERMISSION_RULES_PATCH   optional. Rule-patch path
+#                        (default <repo>/assets/permission-rules.patch.yml).
+#   DSH_PERMISSION_RULES_SOURCE  optional. Install source for the rule plugin
+#                        (default <repo>/third-party/dsh-permission-rules; point
+#                        it at a github: spec once the plugin is published).
+#   DSH_PERMISSION_RULES_PKG     optional. Installed package name
+#                        (default @darklinden/dsh-permission-rules).
+#
+# Permission rules are a policy aid, not the isolation boundary: the tables run
+# regular expressions over tool arguments, while the sandbox and the approval
+# policy remain what actually confines effects. A missing plugin or a failed
+# install costs a warning and an unpatched launch, never the boot; an invalid
+# rule table fails inside the plugin at load, which is the only safe direction
+# for a policy that must not silently disappear.
 #
 # Path convention (pi-ai appends): anthropic-messages posts <base>/v1/messages,
 # openai-* posts <base>/chat/completions or <base>/responses, so one endpoint
@@ -182,6 +207,49 @@ if [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
         echo "  npm install -g --allow-scripts=pnpm pnpm"
     fi
     exit 1
+fi
+
+# ── permission rules ────────────────────────────────────────────────────────
+# The rule plugin is a profile dependency (installed once, like dsh-purge in
+# dsh-jailbreak); the rule table is a tracked patch asset mounted as a second
+# --patch overlay, so a policy edit is a diff in this repo and never a plugin
+# republish. Checked right after the profile exists, because `dsh plugin` would
+# otherwise initialize a missing profile from the generic template — a home
+# that passes the check above but boots no TUI.
+PROFILE_DIR="$DSH_HOME_DIR/profiles/$PROFILE"
+PERMISSION_RULES_PATCH="${DSH_PERMISSION_RULES_PATCH:-$ROOT/assets/permission-rules.patch.yml}"
+PERMISSION_RULES_SOURCE="${DSH_PERMISSION_RULES_SOURCE:-$ROOT/third-party/dsh-permission-rules}"
+PERMISSION_RULES_PKG="${DSH_PERMISSION_RULES_PKG:-@darklinden/dsh-permission-rules}"
+PERMISSION_RULES_STATE=off
+
+# Installed = unpacked in the profile's node_modules AND still declared as a
+# dependency: the second half is what makes the app path resolvable, and a
+# half-installed state costs a reinstall, not a boot.
+permission_rules_ready() {
+    [ -f "$PROFILE_DIR/node_modules/$PERMISSION_RULES_PKG/package.json" ] \
+        && node -e 'const m = require(process.argv[1]); const d = m.dependencies ?? {}; process.exit(process.argv[2] in d ? 0 : 1)' "$PROFILE_DIR/package.json" "$PERMISSION_RULES_PKG"
+}
+
+if [ "${DSH_PERMISSION_RULES:-on}" = "off" ]; then
+    PERMISSION_RULES_STATE=off
+elif [ ! -f "$PERMISSION_RULES_PATCH" ]; then
+    PERMISSION_RULES_STATE=unavailable
+    echo "Permission rules: unavailable — no rule patch at $PERMISSION_RULES_PATCH" >&2
+else
+    if ! permission_rules_ready; then
+        echo "Permission rules: installing $PERMISSION_RULES_PKG into $PROFILE_DIR ..."
+        if DSH_HOME="$DSH_HOME_DIR" dsh plugin --profile "$PROFILE" -- add "$PERMISSION_RULES_SOURCE"; then
+            echo "Permission rules: installed"
+        else
+            echo "Permission rules: WARNING — install failed; launching without the rule patch" >&2
+        fi
+    fi
+    if permission_rules_ready; then
+        PERMISSION_RULES_STATE=on
+    else
+        PERMISSION_RULES_STATE=unavailable
+        echo "Permission rules: WARNING — $PERMISSION_RULES_PKG is not installed; launching without the rule patch" >&2
+    fi
 fi
 
 # Built-in web_search off, web_fetch kept. Both tools come from ONE preset row
@@ -387,6 +455,13 @@ echo "Home: $DSH_HOME_DIR"
 echo "Telemetry: disabled (DSH_TELEMETRY_DISABLED=1)"
 echo "Route: dsa/$DDD_MODEL via $DDD_PROTOCOL @ $DDD_BASE_URL (context $DDD_CONTEXT_WINDOW)"
 echo "Overlay: $OVERLAY"
+if [ "$PERMISSION_RULES_STATE" = "on" ]; then
+    echo "Permission rules: on ($PERMISSION_RULES_PATCH)"
+elif [ "$PERMISSION_RULES_STATE" = "off" ]; then
+    echo "Permission rules: off"
+else
+    echo "Permission rules: $PERMISSION_RULES_STATE"
+fi
 if [ -n "$DERIVED" ]; then
     echo "Web search: built-in web_search disabled, web_fetch kept (preset '$PRESET' takeover${DERIVED_CACHED:+, cached})"
 else
@@ -459,4 +534,10 @@ if [ "${DSA_AGENTS_LINK:-${DSA_SEED_AGENTS:-on}}" != "off" ]; then
     fi
 fi
 
-exec dsh --profile "$PROFILE" --patch "$OVERLAY" "${PRESET_ARG[@]}" "${SESSION_ARG[@]}" "$@"
+# --patch is repeatable: the generated overlay carries the route/preset rows,
+# the rule patch carries the declarative permission table. The rule patch is
+# mounted only when the plugin is actually installed, so a failed install
+# degrades to a normal launch instead of an unresolvable row.
+PATCH_ARGS=(--patch "$OVERLAY")
+[ "$PERMISSION_RULES_STATE" = "on" ] && PATCH_ARGS+=(--patch "$PERMISSION_RULES_PATCH")
+exec dsh --profile "$PROFILE" "${PATCH_ARGS[@]}" "${PRESET_ARG[@]}" "${SESSION_ARG[@]}" "$@"

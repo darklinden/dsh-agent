@@ -15,8 +15,8 @@ dangerous-command guard. It also carries the support files those launchers read 
 ```
 bin/          everything executable and on PATH
 assets/       tracked support files read by scripts (presets, patch overlays, AGENTS template)
-third-party/  submodules (added in Stage 4; empty until then): ai-bridge, micro-agent,
-              dsh-purge-community, dsh-pi-tui, dsh-blender-plugin
+third-party/  submodules: ai-bridge, micro-agent, dsh-purge-community, dsh-pi-tui,
+              dsh-blender-plugin, dsh-permission-rules
 var/          gitignored runtime state: var/logs/<tool>/
 dsh-home/     gitignored DSH homes, one directory per launcher (may hold credentials
               and session history)
@@ -84,6 +84,32 @@ to `wrong-cmd`, while `git`, `npm`, `pnpm` resolve to `wrong-cmd-subcmd`, which 
 the dangerous subcommands and passes everything else through. To guard another command,
 add a symlink to the directory; the listing is the guarded set. Scope is `PATH`
 resolution only.
+
+## Permission rules
+
+`dsh-agent` mounts `assets/permission-rules.patch.yml` as a second `--patch`
+overlay and installs `@darklinden/dsh-permission-rules` into the profile on first
+use (install-once, like the jailbreak plugin). The table declares `deny` / `ask` rules
+matched against a tool name plus one narrow surface — shell command, file path,
+URL, or serialized arguments — so the A2 (no `rm`) and A4 (no secrets) statements
+in `AGENTS.md` are enforced at the tool boundary as well as in prose. Command
+rules can be scoped to simple commands: the plugin splits `&&` / `;` / `|`
+lines, resolves quotes, and strips `sudo` / `timeout` / `env` wrappers before
+matching, so `echo rm` is allowed while `sudo rm` and `git -C repo commit` are
+caught.
+
+A `deny` is returned before any slower reviewer and again from the monotonic tool
+guard, so neither an LLM reviewer (the experimental Auto preset) nor a human
+approval can override it; an `ask` goes through the normal approval flow and
+becomes a denial under `approval: never` (Full access, delegated children). The
+plugin never changes the sandbox mode or the approval policy, so the
+`/permission` presets stay intact.
+
+`DSH_PERMISSION_RULES=off` launches without the patch; `_PATCH`, `_SOURCE` and
+`_PKG` move the rule file, the install source and the package name. The rules are
+a policy aid, not the isolation boundary: patterns run on text and can be dodged
+by quoting or encoding, while the sandbox and approval policy remain what
+confines effects.
 
 ## Trash
 

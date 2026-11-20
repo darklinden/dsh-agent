@@ -18,3 +18,7 @@
 	path = third-party/dsh-blender-plugin
 	url = https://github.com/sixtysevenlf/dsh-blender-plugin.git
 	branch = main
+[submodule "third-party/dsh-permission-rules"]
+	path = third-party/dsh-permission-rules
+	url = https://github.com/darklinden/dsh-permission-rules.git
+	branch = main

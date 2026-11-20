@@ -1,0 +1,125 @@
+# dsh-permission-rules — the global rule table.
+#
+# Mounted by `dsh-agent` as a second --patch overlay for every home and profile
+# it boots (DSH_PERMISSION_RULES=off skips it). The row below inserts the plugin;
+# the plugin itself is a plain profile dependency, so editing this file changes
+# policy without touching the installed package.
+#
+# Why here and not in the plugin's own bundle: these rules are deployment policy
+# for this suite — they mirror the user-global AGENTS.md (A2: no rm, use trash;
+# A4: never read secrets) — so they belong in a tracked, diffable file next to
+# the other overlays, not in a package someone has to republish.
+#
+# Semantics (see third-party/dsh-permission-rules/README.md):
+#   - deny > ask; the first matching ask is returned.
+#   - deny is enforced before any slower reviewer and again in the monotonic
+#     guard, which runs after an approval — neither an LLM reviewer nor a human
+#     click can turn a denial back into permission.
+#   - `tool` is a name, a list, or a `*` glob (whole-name match, `*` is the only
+#     wildcard). `pattern` is a JavaScript regular expression, search semantics.
+#   - `scope: subcommand` (new) matches each simple command of a `&&`/`;`/`|`
+#     line separately, after quotes, leading `VAR=value`, safe wrappers
+#     (`sudo`, `timeout`, `nice`, `nohup`, `env`, `xargs`, …) and redirections
+#     are normalized away. A command the plugin cannot analyze (`$(…)`,
+#     backticks, heredocs, `bash -c`, `eval`) falls back to matching the whole
+#     line, so an unparseable command is never assumed harmless.
+#   - this is a policy aid, not the isolation boundary: a determined command can
+#     still hide from a pattern. The sandbox and the approval policy remain what
+#     actually confines effects.
+- insert:
+    - id: permission-rules
+      name: '@darklinden/dsh-permission-rules'
+      config:
+        # A matched surface above this many UTF-8 bytes denies instead of being
+        # truncated: a truncated surface is a silently bypassable one.
+        maxSurfaceBytes: 65536
+        rules:
+          # A2 of the global rules: deletion goes through the OS trash, never a
+          # delete command. Also covered by the wrong-cmd PATH shim; the rule is
+          # the tool-level statement of the same policy.
+          #
+          # Anchored on the simple command, so `echo rm` and `printf "rm -rf /"`
+          # stay allowed while `sudo rm`, `timeout 5 rm`, `/bin/rm`, `\rm` and
+          # `cd x && rm` are caught.
+          - id: no-rm
+            tool: bash
+            match: command
+            scope: subcommand
+            pattern: '^(?:\S*/)?rm(?:\s|$)'
+            action: deny
+            reason: 'deletion is not allowed: move the target to the OS trash instead'
+
+          # PowerShell's deletion surface: Remove-Item and its aliases (rm, del,
+          # erase, rmdir, ri). Case-insensitive because PowerShell is.
+          - id: no-pwsh-delete
+            tool: pwsh
+            match: command
+            scope: subcommand
+            pattern: '^(remove-item|erase|rmdir|del|ri|rm)(?:\s|$)'
+            flags: i
+            action: deny
+            reason: 'deletion is not allowed: move the target to the OS trash instead'
+
+          # History operations belong to the human (the wrong-cmd shim blocks the
+          # same subcommands on the PATH; this rule also catches absolute paths).
+          # The option group is what makes `git -C /repo commit` match a rule
+          # that names the subcommand.
+          - id: no-git-history
+            tool: [bash, pwsh]
+            match: command
+            scope: subcommand
+            pattern: '^git(?:\s+(?:-C|-c|--git-dir|--work-tree|--namespace)(?:\s+|=)\S+)*\s+(?:commit|push|pull|merge|rebase|reset)\b'
+            action: deny
+            reason: 'commits, syncs and history rewrites belong to the human who started the session'
+
+          # A4 of the global rules: never view or write secret material. Applies
+          # to the fs tools as well, because the sandbox constrains writes only —
+          # reads of these paths are otherwise unrestricted.
+          #
+          # Both separators are admitted (Windows paths use `\`), any `.env.*`
+          # variant counts as a secret except the `.env.example` template, and
+          # matching is case-insensitive for case-insensitive filesystems.
+          - id: no-secret-read
+            tool: [read, read_image, write, edit]
+            match: path
+            pattern: '(^|[/\\])(\.env(\.(?!example)[^/\\]*)?|\.credentials\.yaml|\.anonymous-user-id|id_rsa|id_ed25519|[^/\\]*\.pem)$'
+            flags: i
+            action: deny
+            reason: 'secret material must not be read or written'
+
+          # Piping a download into a shell runs unaudited code. Deny rather than
+          # ask: the approval prompt would show one line, not the script.
+          # `scope` stays `command` here on purpose: the pattern spans the pipe,
+          # so splitting into simple commands would hide it.
+          - id: no-pipe-to-shell
+            tool: [bash, pwsh]
+            match: command
+            pattern: '\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|k|da)?sh\b'
+            action: deny
+            reason: 'piping a download into a shell executes unaudited code; download, inspect, then run'
+
+          # Copying to a remote host publishes content off this machine.
+          - id: ask-remote-copy
+            tool: [bash, pwsh]
+            match: command
+            pattern: '\b(scp|rsync)\b[^|;]*\s[^\s:]+:'
+            action: ask
+            reason: 'copying files to or from a remote host leaves this machine'
+
+          # ── commented templates ─────────────────────────────────────────
+          # MCP tools carry arbitrary arguments; match them as JSON. Tool names
+          # are whole-match globs, so `mcp__*` covers every MCP server's tools.
+          # - id: no-mcp-upload
+          #   tool: 'mcp__*'
+          #   match: args
+          #   pattern: '"url"\s*:\s*"https://(pastebin|transfer\.sh)'
+          #   action: deny
+          #   reason: 'uploading content to a paste service is not allowed'
+          #
+          # URL-bearing tools (web_fetch) match the URL rather than the body.
+          # - id: no-internal-fetch
+          #   tool: web_fetch
+          #   match: url
+          #   pattern: '^https?://(127\.0\.0\.1|localhost|10\.|192\.168\.)'
+          #   action: deny
+          #   reason: 'fetching loopback or private addresses is not allowed'

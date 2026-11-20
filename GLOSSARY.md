@@ -56,6 +56,29 @@ whose target is `../wrong-cmd` or `../wrong-cmd-subcmd`, i.e. the binaries one l
 `wrong-cmd.d/`. After migration that is `bin/`, which is also why those three never need
 their paths rewritten. `DSH_GUARD_ROOT` selects another directory.
 
+## Permission rules
+
+**permission rule** — one `deny`/`ask` entry in the declarative table: a tool
+name (or `*` glob), a narrow surface (`command` / `path` / `url` / `args` /
+`any`), a regular expression, and a reason. Not a capability: the rule plugin
+enforces it on `tools/pre-execute` and again in the monotonic tool guard, so a
+denial survives both an LLM reviewer and an approval click.
+
+**rule patch** — `assets/permission-rules.patch.yml`, the tracked table mounted
+by the rules launcher as a second `--patch` overlay. Editing policy is editing
+this file; the plugin is never republished for it.
+
+**rules launcher** — `bin/dsh-agent-rules`, the trial copy of `dsh-agent` that
+mounts the rule patch. It takes the home name as its first argument, so
+`dsh-agent-rules dsh-permission-rules` tests against `dsh-home/dsh-permission-rules`
+while the shared launcher and home stay untouched; the block is promoted into
+`dsh-agent` once proven (ADR-0011).
+
+**rule plugin** — `third-party/dsh-permission-rules`, a plain profile dependency
+(not a bundle) that compiles the rule patch and registers the two enforcement
+seams. It never writes `sandbox/mode` or `approval/policy`, so it cannot turn a
+permission preset into `custom`.
+
 ## Trash
 
 **`trash`** — `bin/trash`, the suite's one move-to-real-OS-trash command. It dispatches
