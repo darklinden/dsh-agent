@@ -22,3 +22,7 @@
 	path = third-party/dsh-permission-rules
 	url = https://github.com/darklinden/dsh-permission-rules.git
 	branch = main
+[submodule "third-party/dsh-sillytavern-presets"]
+	path = third-party/dsh-sillytavern-presets
+	url = https://github.com/Xxsttb/dsh-sillytavern-presets.git
+	branch = main

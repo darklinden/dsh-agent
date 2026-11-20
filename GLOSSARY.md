@@ -9,7 +9,7 @@ needs the word.
 **superproject** — this repo (`dsh-agent`) as a git repository. It records the pinned
 commit of every submodule but not their contents.
 
-**submodule** — one of the five repos checked out under `third-party/`. Each keeps its
+**submodule** — one of the seven repos checked out under `third-party/`. Each keeps its
 own `.git`, its own remote, and its own history; the superproject only stores a commit
 pointer.
 
@@ -23,8 +23,9 @@ presets, patch overlays, and the AGENTS template.
 never source.
 
 **`dsh-home/`** — gitignored repo-local root for DSH homes, one subdirectory per
-launcher (`dsh-agent`, `dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`). It may hold
-credentials, sessions, and plugin state, so it is never committed.
+launcher (`dsh-agent`, `dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`,
+`dsh-sillytavern`). It may hold credentials, sessions, and plugin state, so it is never
+committed.
 
 **`ROOT`** — the repo root as computed by a script: `dirname "$SCRIPT_DIR"`. Every path
 to `assets/`, `var/`, `third-party/`, or `.env` is expressed through it.
@@ -91,7 +92,8 @@ Linux-side WSL files use XDG Trash. It never creates a homemade `~/.trash`.
 **DSH home** — a directory (`$DSH_HOME`) holding one suite's profiles, sessions,
 credentials, and plugins. Every launcher pins one under `dsh-home/<name>/`:
 `dsh-agent` defaults to `dsh-agent`, its optional first argument replaces that name, and
-the front ends pass their own (`dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`).
+the front ends pass their own (`dsh-jailbreak`, `dsh-photocraft`, `dsh-blender`,
+`dsh-sillytavern`).
 
 **front end** — a `bin/dsh-*` launcher that owns one tool's setup and then
 `exec`s `dsh-agent <home>`; the shared route/guard/AGENTS plumbing lives there.
@@ -114,3 +116,15 @@ instructions. A DSH home never keeps a copy of its own.
 enforced by the launchers on every start. An entry that is not a symlink resolving to the
 template is replaced; differing content is backed up under `backups/agents/` first.
 `DSA_AGENTS_LINK=off` skips enforcement (`DSA_SEED_AGENTS=off` is the legacy spelling).
+
+## SillyTavern presets
+
+**SillyTavern preset** — a SillyTavern AI Response Configuration JSON: `prompts`,
+`prompt_order`, temperature and the sampler block. Not a character card, worldbook, chat
+log or display regex. `dsh-sillytavern` imports one as the plugin's active System
+Prompt layer.
+
+**preset import marker** — `launcher-import.json` next to the plugin's `presets.json`:
+source path, SHA-256, preset id and import time. It makes the launcher's import
+idempotent and lets a changed file archive the previous launcher-managed preset instead
+of duplicating it.

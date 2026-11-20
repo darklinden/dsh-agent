@@ -16,7 +16,7 @@ dangerous-command guard. It also carries the support files those launchers read 
 bin/          everything executable and on PATH
 assets/       tracked support files read by scripts (presets, patch overlays, AGENTS template)
 third-party/  submodules: ai-bridge, micro-agent, dsh-purge-community, dsh-pi-tui,
-              dsh-blender-plugin, dsh-permission-rules
+              dsh-blender-plugin, dsh-permission-rules, dsh-sillytavern-presets
 var/          gitignored runtime state: var/logs/<tool>/
 dsh-home/     gitignored DSH homes, one directory per launcher (may hold credentials
               and session history)
@@ -61,6 +61,7 @@ and `git` for the plugin install.
 | `dsh-photocraft` | `dsh-agent` with the Photocraft automation scope |
 | `dsh-jailbreak` | `dsh-agent` with the purge plugin installed into the profile |
 | `dsh-blender` | `dsh-agent` in the Blender home, with the Blender plugin row (needs the `dsh-blender-plugin` submodule built) |
+| `dsh-sillytavern` | `dsh-agent` in its own home with a SillyTavern AI preset imported as the active TUI prompt layer (no Web UI needed) |
 | `ai-bridge`, `ai-bridge-with-log` | the local model bridge, foreground or logged in the background |
 | `ccc`, `commit` | small helpers |
 | `pull-all`, `push-all` | pull/push this superproject and every submodule, with pointer consistency checks |
@@ -69,15 +70,15 @@ and `git` for the plugin install.
 
 ## Configuration
 
-`.env` at the repository root. See [`.env.example`](.env.example) for all nine variables
-the scripts read, plus the optional switches. Three of them are secrets:
+`.env` at the repository root. See [`.env.example`](.env.example) for the required
+endpoint, MCP and ccc variables plus the optional switches. Three of them are secrets:
 `DDD_AUTH_TOKEN`, `TAVILY_API_KEY`, `CCC_AUTH_TOKEN`.
 
 ## The guard
 
 `dsh-agent` prepends `bin/wrong-cmd.d/` to `PATH` immediately before `exec`;
-`dsh-photocraft`, `dsh-jailbreak` and `dsh-blender` inherit it by exec'ing
-`dsh-agent`. `DSH_GUARD_ROOT` selects another guard bundle directory (default
+`dsh-photocraft`, `dsh-jailbreak`, `dsh-blender` and `dsh-sillytavern` inherit it by
+exec'ing `dsh-agent`. `DSH_GUARD_ROOT` selects another guard bundle directory (default
 `bin/`); `DSH_BLENDER_GUARD_ROOT` remains a legacy alias read by `dsh-blender`.
 Every guarded name is a symlink in that directory — `rm`, `ssh`, `dd`, `mkfs`, … resolve
 to `wrong-cmd`, while `git`, `npm`, `pnpm` resolve to `wrong-cmd-subcmd`, which refuses
@@ -110,6 +111,39 @@ plugin never changes the sandbox mode or the approval policy, so the
 a policy aid, not the isolation boundary: patterns run on text and can be dodged
 by quoting or encoding, while the sandbox and approval policy remain what
 confines effects.
+
+## SillyTavern presets
+
+`dsh-sillytavern` is a thin front end for `dsh-agent` with its own home
+(`dsh-home/dsh-sillytavern`) and the `dsh-sillytavern-presets` plugin installed into
+that home's `pi-tui` profile. On first use it bootstraps `@xmoon76/dsh-pi-tui@0.5.6`
+when the profile is missing, installs the plugin from the checked-out
+`third-party/dsh-sillytavern-presets` submodule, imports one SillyTavern **AI preset**
+and selects it before the TUI starts. The plugin's own settings page is a Web client
+the TUI never mounts; this launcher is the supported way to point the TUI at a preset.
+
+An "AI preset" here is the JSON with `prompts` / `prompt_order` / `temperature` /
+`openai_max_tokens` — SillyTavern's AI Response Configuration. It is not a character
+card, worldbook, chat log or the preset's display regex. The plugin injects the active
+prompts as one System Prompt section and applies temperature/maxTokens to the request;
+the other sampler fields are preserved by the plugin but not applied.
+
+The preset comes from `DSH_SILLYTAVERN_PRESET`; the default is the repo's
+`assets/sillytavern/preset.json` when that file exists. The import is
+idempotent by content hash: an unchanged file is only re-selected, a changed file
+imports a new preset, selects it and archives the previous launcher-managed one.
+`DSH_SILLYTAVERN_IMPORT=off` skips the import, `_FORCE_IMPORT=on` re-imports even when
+unchanged, and `_BOOTSTRAP=off` reports a missing profile instead of installing one.
+The plugin store is
+`dsh-home/dsh-sillytavern/plugin-data/dsh-sillytavern-presets/presets.json`;
+`launcher-import.json` next to it records the source path, hash and preset id.
+
+First install needs the plugin submodule: `git submodule update --init
+third-party/dsh-sillytavern-presets` (or `./install.sh`). Set
+`DSH_SILLYTAVERN_PLUGIN_SOURCE` to another directory, tarball or git spec to override it.
+The preset becomes system instructions and can conflict with `AGENTS.md` or the
+conversation's own rules. The permission rules still deny/ask at the tool boundary, but
+the model's behaviour can change; only import presets you trust.
 
 ## Trash
 

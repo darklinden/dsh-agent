@@ -1,0 +1,257 @@
+#!/usr/bin/env zsh
+
+# dsh-sillytavern [app-args...] — dsh-agent in its own dsh home, with the
+# dsh-sillytavern-presets plugin installed and one SillyTavern AI preset
+# imported as the active prompt layer: the TUI launcher for tavern chat
+# configuration.
+#
+# What "tavern chat configuration" means here
+# -------------------------------------------
+# A SillyTavern AI Response Configuration preset (the JSON holding `prompts`,
+# `prompt_order`, temperature and the sampler block), NOT a character card,
+# worldbook or chat history. dsh-sillytavern-presets is the one candidate that
+# is useful from a TUI: its host half injects the active preset as a System
+# Prompt section and applies temperature/maxTokens on `agent/request`, with no
+# Web client required. The full tavern plugins (dsh-tavern, pmp-dsh-tavern,
+# dsh-nexttavern) are Web/desktop-first: their management UI cannot be mounted
+# by the TUI, and pmp-dsh-tavern 3.0.5 explicitly supports DSH < 0.2.2 while
+# this machine runs 0.2.2-rc.1. ADR-0012 records the trade-off.
+#
+# A thin front end for `dsh-agent` (see that file for the .env contract, the
+# pinned route, telemetry-off, the web_search takeover, the wrong-cmd guard and
+# the AGENTS.md link). This script owns exactly the tavern setup and hands over:
+#
+#   1. make sure this home's profile exists, bootstrapping dsh-pi-tui on first
+#      use (the generic profile template is dsh-base only; adding the TUI
+#      bundle on top is the same one-time install dsh-agent asks for);
+#   2. install dsh-sillytavern-presets from the checked-out
+#      third-party/dsh-sillytavern-presets submodule into that profile, once;
+#   3. import the configured SillyTavern AI preset into the plugin's store and
+#      select it (assets/dsh-sillytavern-import.mjs drives the plugin's own
+#      import/select routes, so its normalization stays authoritative);
+#   4. exec `dsh-agent dsh-sillytavern`: same argv, one home to the left.
+#
+# Why a home: $DSH_HOME is the single root for profiles, sessions, credentials,
+# patch layers and plugin data, so the tavern preset becomes part of a second,
+# fully independent suite. The plugin's store lives at
+# $DSH_HOME/plugin-data/dsh-sillytavern-presets/presets.json; the helper's
+# idempotence marker (launcher-import.json) sits next to it. Both are inside
+# the gitignored dsh-home/ tree.
+#
+# Install-once and failure policy: the plugin is a profile dependency that
+# declares `dsh.bundle.patch`, so `dsh plugin --profile <p> -- add <source>`
+# installs it AND registers it in `dsh.profile.bundles`. The readiness check is
+# package unpacked + dependency declared + bundle selected, so a half-removed
+# state is repaired and a complete state never touches the network. A missing
+# or failed plugin costs a warning, never the boot — the TUI still works
+# without the preset. A failed profile bootstrap is fatal: without dsh-pi-tui
+# there is no TUI to boot, and `dsh plugin` would otherwise initialize a
+# generic dsh-base-only profile that looks installed but starts nothing.
+#
+# Plugin source: the plugin is a git submodule under
+# third-party/dsh-sillytavern-presets and is installed from that checkout, so
+# the profile records a stable `link:` path and there is no download or hash
+# step. If the submodule is not checked out, the launcher reports the exact
+# `git submodule update --init` command and boots without the preset.
+# DSH_SILLYTAVERN_PLUGIN_SOURCE overrides the source (another directory,
+# tarball or git spec); relative overrides are frozen to absolute paths
+# because `dsh plugin` runs pnpm in the profile directory.
+#
+# Preset import: DSH_SILLYTAVERN_PRESET is the file to import. It defaults to
+# <repo>/assets/sillytavern/preset.json when that file exists; set it in
+# .env or the environment to use another SillyTavern AI preset. The helper is
+# idempotent by content hash: an unchanged file is only re-selected, a changed
+# file imports a new preset, selects it and archives the previous
+# launcher-managed one. DSH_SILLYTAVERN_IMPORT=off skips the import entirely
+# and leaves whatever the plugin already has selected alone.
+#
+# dsh-sillytavern-only environment variables:
+#   DSH_SILLYTAVERN_HOME_NAME       optional. dsh home name handed to dsh-agent
+#                                  (default: dsh-sillytavern, i.e.
+#                                  <repo>/dsh-home/dsh-sillytavern).
+#   DSH_SILLYTAVERN_PRESET         optional. SillyTavern AI preset JSON to
+#                                  import. Default: the preset at
+#                                  <repo>/assets/sillytavern/preset.json
+#                                  (only used when that file exists).
+#   DSH_SILLYTAVERN_IMPORT         optional. on (default) | off. off skips the
+#                                  import and never changes the active preset.
+#   DSH_SILLYTAVERN_FORCE_IMPORT   optional. on re-imports even when the source
+#                                  hash is unchanged.
+#   DSH_SILLYTAVERN_BOOTSTRAP      optional. on (default) | off. off reports a
+#                                  missing profile instead of installing
+#                                  dsh-pi-tui into it.
+#   DSH_SILLYTAVERN_PLUGIN_SOURCE  optional. Install source for
+#                                  `dsh plugin ... add`; default
+#                                  <repo>/third-party/dsh-sillytavern-presets.
+#   DSH_SILLYTAVERN_PLUGIN_PKG     optional. Installed package name (default
+#                                  dsh-sillytavern-presets).
+#   DSH_SILLYTAVERN_PI_TUI_PKG    optional. Profile bootstrap spec (default
+#                                  @xmoon76/dsh-pi-tui@0.5.6; 0.5.7 requires
+#                                  DSH >= 0.2.2-rc.3 and this host is rc.1).
+#
+# Everything else is dsh-agent's: DDD_* for the route, DSA_WEB_SEARCH,
+# DSH_PI_TUI_PROFILE / _PRESET / _RESUME_SESSION / _WORKSPACE_TARGET,
+# DSH_CMD_GUARD and DSH_GUARD_ROOT.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    source "$ROOT/.env"
+    set +a
+fi
+
+die() { echo "dsh-sillytavern: $*" >&2; exit 1; }
+
+HOME_NAME="${DSH_SILLYTAVERN_HOME_NAME:-dsh-sillytavern}"
+# Same character set dsh-agent accepts, plus its own rule: the name is handed
+# to dsh-agent as its first argument, so a leading '-' would be read as a flag
+# there and the home this script just installed into would silently not be the
+# home that boots.
+case "$HOME_NAME" in
+    .*|-*|*[!A-Za-z0-9._-]*)
+        die "invalid DSH_SILLYTAVERN_HOME_NAME '$HOME_NAME' (letters, digits, '.', '_', '-' only; must not start with '.' or '-')"
+        ;;
+esac
+DSH_HOME_DIR="$ROOT/dsh-home/$HOME_NAME"
+PROFILE="${DSH_PI_TUI_PROFILE:-pi-tui}"
+PROFILE_DIR="$DSH_HOME_DIR/profiles/$PROFILE"
+
+PLUGIN_DIR="$ROOT/third-party/dsh-sillytavern-presets"
+PLUGIN_SOURCE="${DSH_SILLYTAVERN_PLUGIN_SOURCE:-$PLUGIN_DIR}"
+PLUGIN_PKG="${DSH_SILLYTAVERN_PLUGIN_PKG:-dsh-sillytavern-presets}"
+PI_TUI_PKG="${DSH_SILLYTAVERN_PI_TUI_PKG:-@xmoon76/dsh-pi-tui@0.5.6}"
+DEFAULT_PRESET_FILE="$ROOT/assets/sillytavern/preset.json"
+PRESET_FILE="${DSH_SILLYTAVERN_PRESET:-$DEFAULT_PRESET_FILE}"
+IMPORT_STATE="${DSH_SILLYTAVERN_IMPORT:-on}"
+BOOTSTRAP_STATE="${DSH_SILLYTAVERN_BOOTSTRAP:-on}"
+
+if ! command -v dsh >/dev/null 2>&1; then
+    echo "dsh is not on PATH. Install it first:"
+    echo "  npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs @deepseek-ai/dsh@latest"
+    exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+    echo "node is not on PATH; dsh itself needs Node.js. Install Node ^22.19 or >=24 first." >&2
+    exit 1
+fi
+
+ensure_pnpm() {
+    command -v pnpm >/dev/null 2>&1 && return 0
+    echo "SillyTavern: pnpm is not on PATH — 'dsh plugin' forwards to pnpm. Install it first:" >&2
+    echo "  npm install -g --allow-scripts=pnpm pnpm" >&2
+    return 1
+}
+
+profile_bundles_ok() {
+    node -e 'const m = require(process.argv[1]); const b = m.dsh?.profile?.bundles ?? []; process.exit(b.includes("@deepseek-ai/dsh-base") && b.includes("@xmoon76/dsh-pi-tui") ? 0 : 1)' "$PROFILE_DIR/package.json"
+}
+
+# ── profile bootstrap ───────────────────────────────────────────────────────
+# A missing profile is bootstrapped explicitly with dsh-pi-tui. That is NOT the
+# generic profile `dsh plugin` would create on its own: the template is
+# dsh-base only, so installing a plugin into a missing profile would leave a
+# profile that passes dsh-agent's directory check but boots no TUI.
+if [ ! -f "$PROFILE_DIR/package.json" ]; then
+    if [ "$BOOTSTRAP_STATE" = "off" ]; then
+        echo "SillyTavern: profile '$PROFILE' is not installed under $DSH_HOME_DIR. Install dsh-pi-tui first:"
+        echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add $PI_TUI_PKG"
+        exit 1
+    fi
+    ensure_pnpm || exit 1
+    echo "SillyTavern: profile '$PROFILE' is not installed; bootstrapping $PI_TUI_PKG ..."
+    mkdir -p "$DSH_HOME_DIR" || die "could not create $DSH_HOME_DIR"
+    if ! DSH_HOME="$DSH_HOME_DIR" dsh plugin --profile "$PROFILE" -- add "$PI_TUI_PKG"; then
+        die "could not install $PI_TUI_PKG into $DSH_HOME_DIR; retry: DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add $PI_TUI_PKG"
+    fi
+    [ -f "$PROFILE_DIR/package.json" ] || die "the install command finished but $PROFILE_DIR/package.json is still missing"
+fi
+
+# The directory check above is not enough: a generic profile (or a hand-edited
+# bundle list) can exist without a TUI surface. Gate every launch, not only the
+# one that just bootstrapped, so this home never boots "nothing".
+profile_bundles_ok || die "profile '$PROFILE' under $DSH_HOME_DIR does not select @deepseek-ai/dsh-base and @xmoon76/dsh-pi-tui as bundles; repair it with: DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add $PI_TUI_PKG"
+
+# ── plugin readiness ────────────────────────────────────────────────────────
+# Installed = the package is unpacked, still declared as a dependency, and still
+# selected as a bundle. A half-installed state would load nothing (or not
+# survive the next install), so all three are treated as one unit; a complete
+# state costs nothing and touches the network never.
+plugin_ready() {
+    [ -f "$PROFILE_DIR/node_modules/$PLUGIN_PKG/package.json" ] \
+        && node -e 'const m = require(process.argv[1]); const d = m.dependencies ?? {}; process.exit((m.dsh?.profile?.bundles ?? []).includes(process.argv[2]) && process.argv[2] in d ? 0 : 1)' "$PROFILE_DIR/package.json" "$PLUGIN_PKG"
+}
+
+# Freeze a relative local override to an absolute path: `dsh plugin` runs pnpm
+# in the PROFILE directory, so a relative source would resolve there, not in the
+# caller's cwd. URLs and git specs pass through untouched.
+resolve_plugin_source() {
+    if [ -e "$PLUGIN_SOURCE" ]; then
+        print -r -- "$(realpath "$PLUGIN_SOURCE")"
+    else
+        print -r -- "$PLUGIN_SOURCE"
+    fi
+}
+
+PLUGIN_STATE=present
+if ! plugin_ready; then
+    PLUGIN_STATE=failed
+    if [ "$PLUGIN_SOURCE" = "$PLUGIN_DIR" ] \
+       && { [ ! -f "$PLUGIN_DIR/package.json" ] || [ ! -f "$PLUGIN_DIR/lib/index.js" ]; }; then
+        PLUGIN_STATE=missing
+    elif ensure_pnpm; then
+        if RESOLVED_SOURCE="$(resolve_plugin_source)"; then
+            echo "SillyTavern: installing $PLUGIN_PKG into $PROFILE_DIR ..."
+            if DSH_HOME="$DSH_HOME_DIR" dsh plugin --profile "$PROFILE" -- add "$RESOLVED_SOURCE"; then
+                if plugin_ready; then
+                    PLUGIN_STATE=installed
+                else
+                    PLUGIN_STATE=partial
+                fi
+            fi
+        fi
+    fi
+fi
+
+case "$PLUGIN_STATE" in
+    installed) echo "SillyTavern: $PLUGIN_PKG installed -> $PROFILE_DIR" ;;
+    present)   echo "SillyTavern: $PLUGIN_PKG present -> $PROFILE_DIR" ;;
+    missing)   echo "SillyTavern: WARNING — plugin submodule is missing or incomplete: $PLUGIN_DIR" >&2
+               echo "           run: git -C \"$ROOT\" submodule update --init third-party/dsh-sillytavern-presets" >&2
+               echo "           this session boots without the preset." >&2
+               ;;
+    partial)   echo "SillyTavern: WARNING — the install command succeeded but $PLUGIN_PKG is still not selected in $PROFILE_DIR;" >&2
+               echo "           check that \"$PLUGIN_SOURCE\" is the $PLUGIN_PKG plugin. This session boots without it." >&2
+               ;;
+    failed)    echo "SillyTavern: WARNING — could not install $PLUGIN_PKG; this session boots without it." >&2
+               echo "           retry: DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add \"$PLUGIN_SOURCE\"" >&2
+               ;;
+esac
+
+# ── preset import ───────────────────────────────────────────────────────────
+# The plugin's own import route does the parsing/persistence; the helper only
+# chooses import vs select vs archive and keeps the content-hash marker. A
+# failed import is a warning: the plugin may already have a usable active
+# preset, and the TUI itself is independent of this step.
+IMPORT_HELPER="$ROOT/assets/dsh-sillytavern-import.mjs"
+if [ "$IMPORT_STATE" = "off" ]; then
+    echo "SillyTavern: preset import off (DSH_SILLYTAVERN_IMPORT=off)"
+elif [ -z "$PRESET_FILE" ]; then
+    echo "SillyTavern: no preset configured; set DSH_SILLYTAVERN_PRESET to a SillyTavern AI preset JSON." >&2
+elif [ ! -f "$PRESET_FILE" ]; then
+    echo "SillyTavern: preset file not found: $PRESET_FILE; skipping import." >&2
+elif [ ! -f "$IMPORT_HELPER" ]; then
+    echo "SillyTavern: WARNING — import helper $IMPORT_HELPER is missing; skipping import." >&2
+elif [ ! -f "$PROFILE_DIR/node_modules/$PLUGIN_PKG/lib/index.js" ]; then
+    echo "SillyTavern: preset import skipped — $PLUGIN_PKG is not installed." >&2
+else
+    echo "SillyTavern: importing preset from $PRESET_FILE ..."
+    if ! DSH_HOME="$DSH_HOME_DIR" DSH_SILLYTAVERN_PLUGIN_PKG="$PLUGIN_PKG" node "$IMPORT_HELPER" "$PROFILE_DIR" "$PRESET_FILE"; then
+        echo "SillyTavern: WARNING — preset import failed; the session boots without a freshly imported preset." >&2
+    fi
+fi
+
+echo "SillyTavern: home $DSH_HOME_DIR (profile $PROFILE)"
+exec "$SCRIPT_DIR/dsh-agent" "$HOME_NAME" "$@"
