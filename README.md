@@ -42,7 +42,9 @@ cp .env.example .env && chmod 600 .env   # fill in the values
 
 `install.sh` is idempotent. It initialises submodules, builds `bin/ai-bridge` and `bin/ma`
 with `cargo build --release` (then `cargo clean`s the multi-GB `target/`), fetches
-`photocraft-cli` from its GitHub release, creates `var/` and `dsh-home/`, and tells you
+`photocraft-cli` from its GitHub release (macOS only — elsewhere it warns and skips, or
+installs a binary you pass as `PHOTOCRAFT_CLI=/path/to/photocraft-cli`), creates `var/` and
+`dsh-home/`, and tells you
 whether `bin/` is on `PATH`. It never edits your shell configuration; add this line
 yourself, above any older copy of these scripts:
 

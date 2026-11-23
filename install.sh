@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Idempotent: submodules -> build bin/{ai-bridge,ma} (then cargo clean) ->
-# fetch the latest photocraft-cli -> create var/ and dsh-home/ -> report PATH status.
+# fetch the latest photocraft-cli (macOS only; skipped elsewhere) -> create var/
+# and dsh-home/ -> report PATH status.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd "$ROOT"
@@ -21,6 +22,9 @@ cleanup() {
 trap cleanup EXIT
 
 PHOTOCRAFT_VERSION="${PHOTOCRAFT_CLI_VERSION:-}"   # empty => the latest release
+# Optional local binary, installed as-is instead of downloading the release.
+# This is the escape hatch for platforms upstream ships no CLI build for.
+PHOTOCRAFT_BIN="${PHOTOCRAFT_CLI:-}"
 
 # Version selection: an explicit PHOTOCRAFT_CLI_VERSION always wins; otherwise
 # follow the latest release tag. Resolving through the /releases/latest redirect
@@ -57,16 +61,47 @@ build_rust micro-agent ma
 
 install_photocraft() {
     local want="$PHOTOCRAFT_VERSION" have=""
+    if [ -n "$PHOTOCRAFT_BIN" ]; then
+        { [ -f "$PHOTOCRAFT_BIN" ] && [ -x "$PHOTOCRAFT_BIN" ]; } \
+            || die "PHOTOCRAFT_CLI=$PHOTOCRAFT_BIN is not an executable file"
+        # `install` refuses to copy a file onto itself, and a globally exported
+        # PHOTOCRAFT_CLI may well point at an already-installed copy.
+        if [ -f bin/photocraft-cli ] && [ "$PHOTOCRAFT_BIN" -ef bin/photocraft-cli ]; then
+            say "photocraft-cli already installed from PHOTOCRAFT_CLI"
+            return 0
+        fi
+        say "installing photocraft-cli from PHOTOCRAFT_CLI=$PHOTOCRAFT_BIN"
+        install -m 0755 "$PHOTOCRAFT_BIN" bin/photocraft-cli
+        say "photocraft-cli -> bin/photocraft-cli ($(bin/photocraft-cli --version 2>/dev/null || echo 'version unknown'))"
+        return 0
+    fi
+    # A binary from another platform cannot be exec'd here: `--version` fails
+    # (ENOEXEC) and, under `set -e` + `pipefail`, a bare assignment would abort
+    # the whole install silently. Treat an unrunnable binary as "not installed".
+    if [ -x bin/photocraft-cli ]; then
+        have=$(bin/photocraft-cli --version 2>/dev/null | awk '{print $2}') || have=""
+    fi
+    # Upstream publishes the CLI as a macOS universal binary only. Everywhere
+    # else the rest of the install is still useful, so skipping is a warning,
+    # never a failure — and the version lookup is skipped to stay offline-safe.
+    if [ "$(uname -s)" != "Darwin" ]; then
+        if [ -n "$have" ]; then
+            say "photocraft-cli $have present (no upstream $(uname -s) build — leaving it as is)"
+        elif [ -e bin/photocraft-cli ]; then
+            say "warning: bin/photocraft-cli does not run on $(uname -s) — upstream ships a macOS-only CLI"
+            say "         move it aside, or install a native build: PHOTOCRAFT_CLI=/path/to/photocraft-cli ./install.sh"
+        else
+            say "warning: photocraft-cli has no $(uname -s) build upstream — skipping the download"
+            say "         optional: PHOTOCRAFT_CLI=/path/to/photocraft-cli ./install.sh"
+        fi
+        return 0
+    fi
     if [ -z "$want" ]; then
         say "resolving the latest photocraft-cli release"
         want=$(resolve_photocraft_version) \
             || die "could not resolve the latest photocraft release — set PHOTOCRAFT_CLI_VERSION=x.y.z and re-run"
     fi
-    if [ -x bin/photocraft-cli ]; then
-        have=$(bin/photocraft-cli --version 2>/dev/null | awk '{print $2}')
-    fi
     if [ "$have" = "$want" ]; then say "photocraft-cli $want already installed"; return 0; fi
-    [ "$(uname -s)" = "Darwin" ] || die "photocraft-cli fetch is macOS-only; set PHOTOCRAFT_CLI to an existing binary"
     command -v curl >/dev/null || die "curl not found"
     command -v unzip >/dev/null || die "unzip not found"
     local url="https://github.com/storytold/photocraft/releases/download/v${want}/photocraft-cli-${want}-macos-universal.zip"
