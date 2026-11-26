@@ -1,0 +1,581 @@
+#!/usr/bin/env zsh
+
+# dsh-upgrade — upgrade the global dsh and every plugin in each DSH home.
+#
+# Why this exists: dsh and its plugins move independently, and this suite keeps
+# one profile per home under dsh-home/. Updating dsh alone leaves plugin ranges
+# stale; updating a profile against the old dsh can adopt a plugin that the next
+# dsh refuses. This command therefore upgrades dsh FIRST, then lets that new dsh
+# resolve every profile, so the new plugin manager and its compatibility rules
+# are the ones deciding the update.
+#
+# Default run:
+#   1. npm install -g --allow-scripts=<list> @deepseek-ai/dsh@latest
+#   2. for every <homes-root>/*/profiles/* that has a package.json:
+#        <npm-prefix>/bin/dsh plugin --profile <profile> -- update
+#   3. for every local source a profile links (@xmoon76/dsh-pi-tui):
+#        bin/dsh-pi-tui-build <checkout>
+#
+# In the default flow, profile updates deliberately use npm's own global dsh,
+# not whatever `dsh` happens to come first on PATH: a dev checkout or an older
+# copy earlier on PATH would otherwise resolve the profiles with the wrong
+# plugin manager. With --no-dsh that guarantee is intentionally given up; the
+# dsh already on PATH is used and warned about.
+#
+# Each profile's package.json, pnpm-lock.yaml and pnpm-workspace.yaml are copied
+# under backups/dsh-upgrade/<timestamp>/ before pnpm runs, and the pnpm output is
+# kept there as pnpm.log. The store is never forced: pnpm refuses updates once
+# node_modules was linked from a different store (a newer pnpm, a changed
+# store-dir, a profile installed under another default), so that one error is
+# answered with a single frozen install and the update is retried — the profile
+# converges on whatever store pnpm resolves now instead of being pinned to the
+# old one. A failed update prints the exact cp commands that restore those
+# manifests, plus the `pnpm install` that rebuilds node_modules from them. A
+# failing profile never stops the remaining ones; the command exits 1 if any
+# requested step failed.
+#
+# Scope: profile dependencies, plus the build of any local source those profiles
+# link. `link:` plugins (the permission rules, the SillyTavern presets) follow
+# their third-party/ checkout, and pulling that checkout stays pull-all's job —
+# this command must not move a submodule commit. What pull-all cannot do is
+# rebuild: a checkout's dist/ is gitignored, so after a pull the linked bundle
+# (the TUI, ADR-0013) still loads the previous code. Step 3 closes that gap by
+# calling bin/dsh-pi-tui-build, which is a no-op while dist/ is current.
+# The Blender plugin is loaded by file path from its own checkout and is not a
+# profile dependency, so a dsh upgrade may need a rebuild. Submodules' sources
+# and bin/ binaries are otherwise out of scope: this command is safe to run from
+# any directory and never changes the superproject's git state on its own
+# (dist/ and node_modules/ are ignored inside the checkout; the one exception is
+# a rebuild that rewrites the tracked generated/ tree, which is reported and left
+# for the operator to commit or revert).
+#
+# Safety:
+#   * no sudo and no shell-configuration edits; a global prefix npm cannot write
+#     is reported with the exact command instead;
+#   * dsh is upgraded first and a failure aborts before any profile is touched;
+#   * no allow-version is auto-granted; dsh reports an incompatible plugin at
+#     boot with the exact approval command, which stays a human decision;
+#   * --latest is opt-in: without it pnpm respects the ranges already declared
+#     in package.json; with it ranges (and major versions) can move.
+#
+# Options:
+#   -n, --check       report dsh and per-profile update availability; installs
+#                     and updates nothing
+#       --no-dsh      skip the global dsh upgrade
+#       --no-plugins  skip the profile plugin updates
+#   -L, --latest      pass --latest to pnpm update (not valid with --check)
+#   -h, --help        show this help
+#
+# Environment:
+#   DSH_UPGRADE_DSH_SPEC      npm spec (default @deepseek-ai/dsh@latest)
+#   DSH_UPGRADE_ALLOW_SCRIPTS comma list for --allow-scripts (default: the list
+#                             the launchers print)
+#   DSH_UPGRADE_HOMES_ROOT    DSH homes root (default <repo>/dsh-home; point it
+#                             at ~/.dsh for a user-global install)
+#   DSH_UPGRADE_BACKUP_ROOT   profile manifest backups
+#                             (default <repo>/backups/dsh-upgrade)
+#
+# Exit status: 0 all requested updates succeeded (or --check completed);
+# 1 an upgrade/check failed; 2 a usage error.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+DSH_SPEC="${DSH_UPGRADE_DSH_SPEC:-@deepseek-ai/dsh@latest}"
+ALLOW_SCRIPTS="${DSH_UPGRADE_ALLOW_SCRIPTS:-@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs}"
+HOMES_ROOT_EXPLICIT=0
+if [ -n "${DSH_UPGRADE_HOMES_ROOT:-}" ]; then
+    HOMES_ROOT_EXPLICIT=1
+fi
+HOMES_ROOT="${DSH_UPGRADE_HOMES_ROOT:-$ROOT/dsh-home}"
+BACKUP_ROOT="${DSH_UPGRADE_BACKUP_ROOT:-$ROOT/backups/dsh-upgrade}"
+HOMES_ROOT="${HOMES_ROOT:A}"
+BACKUP_ROOT="${BACKUP_ROOT:A}"
+STAMP="$(date +%Y%m%dT%H%M%S).$$"
+
+MODE=update
+DO_DSH=1
+DO_PLUGINS=1
+LATEST=0
+DFAILED=0
+SUMMARY=()
+typeset -A PI_TUI_LINKS
+DSH_BEFORE=""
+DSH_AFTER=""
+DSH_CMD=""
+DSH_NPM_BEFORE=""
+LATEST_DSH=""
+
+usage() {
+    cat <<'EOF'
+Usage: dsh-upgrade [options]
+
+Upgrade the global dsh, then every plugin in each DSH home's profiles.
+
+Default run:
+  npm install -g --allow-scripts=<list> @deepseek-ai/dsh@latest
+  <npm-prefix>/bin/dsh plugin --profile <profile> -- update   (every profile)
+  bin/dsh-pi-tui-build <checkout>                             (every linked source)
+
+The dsh upgrade runs first, and the profiles are then resolved by npm's global
+dsh, not by a different dsh earlier on PATH. --no-dsh skips the upgrade and uses
+the dsh already on PATH instead. Each profile's package.json,
+pnpm-lock.yaml and pnpm-workspace.yaml are copied to
+backups/dsh-upgrade/<timestamp>/ before pnpm runs; a failed update prints the
+exact commands that restore them and reinstall the previous node_modules. A
+profile that fails does not stop the others.
+
+Options:
+  -n, --check       report dsh and per-profile update availability; installs
+                    and updates nothing
+      --no-dsh      skip the global dsh upgrade
+      --no-plugins  skip the profile plugin updates
+  -L, --latest      pass --latest to pnpm update: cross the ranges already in
+                    package.json (may cross major versions); not with --check
+  -h, --help        show this help and exit
+
+Environment:
+  DSH_UPGRADE_DSH_SPEC      npm spec (default @deepseek-ai/dsh@latest)
+  DSH_UPGRADE_ALLOW_SCRIPTS comma list for --allow-scripts
+                            (default: @deepseek-ai/dsh-subprocess-local,koffi,
+                            node-pty,@google/genai,protobufjs)
+  DSH_UPGRADE_HOMES_ROOT    DSH homes root (default <repo>/dsh-home)
+  DSH_UPGRADE_BACKUP_ROOT   profile manifest backups
+                            (default <repo>/backups/dsh-upgrade)
+
+Scope:
+  * profiles are <homes-root>/*/profiles/* with a package.json;
+  * --check runs `pnpm outdated` in each profile and changes no manifest;
+  * local `link:` plugins follow their third-party/ checkout; refresh it with
+    pull-all, not with this command;
+  * a profile that links the TUI bundle (@xmoon76/dsh-pi-tui) gets it rebuilt
+    from that checkout: its dist/ is gitignored, so a pulled source otherwise
+    boots the previous code;
+  * the Blender plugin is loaded from third-party/dsh-blender-plugin by file
+    path, so a dsh upgrade may need its rebuild;
+  * an incompatible plugin is refused at boot; review the printed
+    `dsh plugin ... allow-version` command before granting it;
+  * stop running sessions first: `dsh plugin` locks each profile's package.json.
+
+Exit status: 0 all requested updates succeeded (or --check completed);
+1 an upgrade/check failed; 2 a usage error.
+EOF
+}
+
+err() { print -u2 "dsh-upgrade: $*" }
+warn() { print -u2 "dsh-upgrade: warning: $*" }
+die() { err "$*"; exit 1 }
+
+backup_profile() {
+    local home="$1" profile="$2" src="$3" dest file
+    dest="$BACKUP_ROOT/$STAMP/$home/$profile"
+    if ! mkdir -p "$dest"; then
+        err "could not create backup directory $dest"
+        return 1
+    fi
+    for file in package.json pnpm-lock.yaml pnpm-workspace.yaml; do
+        if [ -f "$src/$file" ]; then
+            if ! cp -p "$src/$file" "$dest/$file"; then
+                err "could not back up $src/$file"
+                return 1
+            fi
+        fi
+    done
+    return 0
+}
+
+rollback_hint() {
+    local home="$1" profile="$2" src="$3"
+    local backup="$BACKUP_ROOT/$STAMP/$home/$profile" file
+    print -u2 -r -- "  rollback this profile with:"
+    for file in package.json pnpm-lock.yaml pnpm-workspace.yaml; do
+        if [ -f "$backup/$file" ]; then
+            print -u2 -r -- "    cp -p ${(q)backup}/$file ${(q)src}/$file"
+        fi
+    done
+    if [ -f "$backup/pnpm-lock.yaml" ]; then
+        print -u2 -r -- "    (cd ${(q)src} && pnpm install --frozen-lockfile)"
+    else
+        print -u2 -r -- "    (cd ${(q)src} && pnpm install)"
+    fi
+}
+
+# The one profile dependency whose build product lives in the checkout rather
+# than in the profile: pnpm never rebuilds a linked source. Prints the declared
+# link target (resolved against the profile) or nothing.
+pi_tui_link_target() {
+    node -e '
+const path = require("node:path");
+const m = require(process.argv[1]);
+const v = (m.dependencies ?? {})["@xmoon76/dsh-pi-tui"];
+if (typeof v !== "string" || !v.startsWith("link:")) process.exit(0);
+process.stdout.write(path.resolve(path.dirname(process.argv[1]), v.slice(5)));
+' "$1" 2>/dev/null
+}
+
+print_outdated_json() {
+    node -e '
+let data = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { data += chunk; });
+process.stdin.on("end", () => {
+    let value;
+    try {
+        value = JSON.parse(data);
+    } catch {
+        process.exit(1);
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        process.exit(1);
+    }
+    for (const [name, info] of Object.entries(value)) {
+        const current = info && info.current !== undefined ? info.current : "?";
+        const latest = info && info.latest !== undefined ? info.latest : "?";
+        process.stdout.write(`  ${name} ${current} -> ${latest}\n`);
+    }
+    process.exit(0);
+});
+'
+}
+
+while (( $# )); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        -n|--check) MODE=check ;;
+        --no-dsh) DO_DSH=0 ;;
+        --no-plugins) DO_PLUGINS=0 ;;
+        -L|--latest) LATEST=1 ;;
+        --)
+            shift
+            if (( $# )); then
+                err "unexpected argument '$1'"
+                usage >&2
+                exit 2
+            fi
+            break
+            ;;
+        -*)
+            err "unknown option '$1'"
+            usage >&2
+            exit 2
+            ;;
+        *)
+            err "unexpected argument '$1'"
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if (( ! DO_DSH && ! DO_PLUGINS )); then
+    err "nothing to do: --no-dsh and --no-plugins were both given"
+    exit 2
+fi
+if (( LATEST )) && [ "$MODE" = check ]; then
+    err "--latest has no effect with --check"
+    exit 2
+fi
+if (( LATEST )) && (( ! DO_PLUGINS )); then
+    err "--latest only applies to the profile plugin step"
+    exit 2
+fi
+
+command -v node >/dev/null 2>&1 || die "node is not on PATH; dsh itself needs Node.js"
+print "node: $(node --version 2>/dev/null)"
+if (( DO_DSH )); then
+    command -v npm >/dev/null 2>&1 || die "npm is not on PATH; it is needed to upgrade dsh"
+    print "npm:  $(npm --version 2>/dev/null)"
+fi
+if (( DO_PLUGINS )); then
+    if ! command -v pnpm >/dev/null 2>&1; then
+        err "'dsh plugin' forwards to pnpm, which is not on PATH."
+        err "  install it first: npm install -g --allow-scripts=pnpm pnpm"
+        exit 1
+    fi
+    # Reported, not enforced: this is the pnpm the profiles run under, and the
+    # first thing to check when a store or lockfile complaint looks impossible.
+    print "pnpm: $(pnpm --version 2>/dev/null)"
+fi
+
+if command -v dsh >/dev/null 2>&1; then
+    DSH_BEFORE=$(dsh --version 2>/dev/null | head -1)
+fi
+
+if [ "$MODE" = update ]; then
+    if (( ! DO_DSH )); then
+        warn "the dsh upgrade is skipped; plugin updates resolve against the current dsh"
+        if (( DO_PLUGINS )); then
+            DSH_CMD="$(command -v dsh 2>/dev/null || true)"
+            if [ -z "$DSH_CMD" ]; then
+                err "dsh is not on PATH; its profiles cannot be updated."
+                err "  install it first: npm install -g --allow-scripts=\"$ALLOW_SCRIPTS\" @deepseek-ai/dsh@latest"
+                exit 1
+            fi
+        fi
+    else
+        NPM_PREFIX="$(npm prefix -g 2>/dev/null || true)"
+        NPM_ROOT="$(npm root -g 2>/dev/null || true)"
+        if [ -z "$NPM_PREFIX" ] || [ -z "$NPM_ROOT" ]; then
+            err "could not determine npm's global prefix/root (npm prefix -g, npm root -g)."
+            exit 1
+        fi
+        NPM_DSH="$NPM_PREFIX/bin/dsh"
+        if [ -f "$NPM_ROOT/@deepseek-ai/dsh/package.json" ]; then
+            DSH_NPM_BEFORE=$(node -e 'try { process.stdout.write(require(process.argv[1]).version) } catch { process.exit(1) }' \
+                "$NPM_ROOT/@deepseek-ai/dsh/package.json" 2>/dev/null) || DSH_NPM_BEFORE=""
+        fi
+        dsh_on_path="$(command -v dsh 2>/dev/null || true)"
+        if [ -n "$dsh_on_path" ]; then
+            dsh_real="$(realpath "$dsh_on_path" 2>/dev/null || print -r -- "$dsh_on_path")"
+            case "$dsh_real" in
+                "$NPM_ROOT"/*) ;;
+                *)
+                    warn "dsh on PATH resolves to $dsh_real, outside npm's global root $NPM_ROOT"
+                    warn "profile updates will use npm's copy at $NPM_DSH"
+                    ;;
+            esac
+        fi
+        print ""
+        print "==> upgrading dsh: npm install -g --allow-scripts=$ALLOW_SCRIPTS $DSH_SPEC"
+        if ! npm install -g --allow-scripts="$ALLOW_SCRIPTS" "$DSH_SPEC"; then
+            err "dsh upgrade failed; profile plugins were not touched."
+            err "  retry manually: npm install -g --allow-scripts=\"$ALLOW_SCRIPTS\" \"$DSH_SPEC\""
+            err "  if npm reports EACCES, fix the permissions of 'npm prefix -g'; this script never runs sudo."
+            exit 1
+        fi
+        if [ ! -x "$NPM_DSH" ]; then
+            err "npm reported success, but $NPM_DSH is not executable."
+            err "  check 'npm prefix -g' and the global bin layout; profile updates were not started."
+            exit 1
+        fi
+        DSH_CMD="$NPM_DSH"
+        DSH_AFTER=$("$DSH_CMD" --version 2>/dev/null | head -1)
+        if [ -z "$DSH_AFTER" ]; then
+            err "npm's dsh at $DSH_CMD is not runnable."
+            err "  run: $DSH_CMD --version"
+            exit 1
+        fi
+        print "dsh: ${DSH_NPM_BEFORE:-not installed} -> $DSH_AFTER ($DSH_CMD)"
+    fi
+elif (( DO_DSH )); then
+    LATEST_DSH=$(npm view "$DSH_SPEC" version | tail -1)
+    if [ -z "$LATEST_DSH" ]; then
+        warn "could not query the latest version of $DSH_SPEC"
+        DFAILED=1
+    fi
+    print "dsh: ${DSH_BEFORE:-not installed} (latest: ${LATEST_DSH:-unknown})"
+fi
+
+if (( DO_PLUGINS )) && [ "$MODE" = update ] && [ -z "$DSH_CMD" ]; then
+    err "no dsh command is available for the profile updates."
+    exit 1
+fi
+
+profile_dirs=("$HOMES_ROOT"/*/profiles/*(/N))
+profiles=()
+for dir in "${profile_dirs[@]}"; do
+    if [ -f "$dir/package.json" ]; then
+        profiles+=("$dir")
+    fi
+done
+
+if (( DO_PLUGINS )); then
+    if (( ${#profiles} == 0 )); then
+        if (( HOMES_ROOT_EXPLICIT )); then
+            err "no profiles found under $HOMES_ROOT/*/profiles (DSH_UPGRADE_HOMES_ROOT is set explicitly)"
+            DFAILED=1
+        elif [ ! -d "$HOMES_ROOT" ]; then
+            warn "no DSH homes root at $HOMES_ROOT"
+        else
+            warn "no profiles found under $HOMES_ROOT/*/profiles"
+        fi
+    fi
+    if [ "$MODE" = update ] && (( ${#profiles} > 0 )); then
+        print "backups: $BACKUP_ROOT/$STAMP"
+    fi
+    if [ "$MODE" = check ] && (( ${#profiles} > 0 )); then
+        print "checking with pnpm outdated (updates, not failures)"
+    fi
+fi
+
+if (( DO_PLUGINS )); then
+    for profile_dir in "${profiles[@]}"; do
+        home_dir="${profile_dir:h:h}"
+        home="${home_dir:t}"
+        profile="${profile_dir:t}"
+        label="$home/$profile"
+        print ""
+        print "==> $label"
+
+        # Collected before the mode split: --check reports the build state too.
+        pi_tui_link=$(pi_tui_link_target "$profile_dir/package.json")
+        [ -n "$pi_tui_link" ] && PI_TUI_LINKS[$pi_tui_link]=1
+
+        if [ "$MODE" = check ]; then
+            check_json=$(cd "$profile_dir" && pnpm outdated --format=json)
+            rc=$?
+            if (( rc != 0 && rc != 1 )); then
+                SUMMARY+=("check-failed  $label")
+                DFAILED=1
+            elif [ -n "$check_json" ] && print_outdated_json <<< "$check_json"; then
+                if (( rc == 0 )); then
+                    SUMMARY+=("up-to-date    $label")
+                else
+                    SUMMARY+=("outdated      $label")
+                fi
+            elif (( rc == 0 )); then
+                SUMMARY+=("up-to-date    $label")
+            else
+                SUMMARY+=("check-failed  $label")
+                DFAILED=1
+            fi
+            continue
+        fi
+
+        if ! backup_profile "$home" "$profile" "$profile_dir"; then
+            SUMMARY+=("backup-failed $label")
+            DFAILED=1
+            continue
+        fi
+
+        update_args=()
+        if (( LATEST )); then
+            update_args=(--latest)
+        fi
+
+        env_args=(DSH_HOME="$home_dir")
+        # The profile's backup directory already exists (backup_profile made it)
+        # and is gitignored, so the log cannot fail on a missing parent.
+        update_log="$BACKUP_ROOT/$STAMP/$home/$profile/pnpm.log"
+
+        env "${env_args[@]}" "$DSH_CMD" plugin --profile "$profile" -- update "${update_args[@]}" 2>&1 \
+            | tee "$update_log"
+        rc=$pipestatus[1]
+        relink_failed=
+        relinked=
+        if (( rc != 0 )) && grep -q 'ERR_PNPM_UNEXPECTED_STORE' "$update_log" 2>/dev/null; then
+            # pnpm refuses updates once node_modules was linked from another
+            # store (a newer pnpm, a changed store-dir, a profile installed
+            # under another default). The guard fires before dsh can touch
+            # the profile and pnpm's own advice is to reinstall, so: relink the
+            # existing tree to the store pnpm resolves today (`dsh plugin ...
+            # install` keeps dsh's config, a bare pnpm would not), then retry
+            # the update once. The store is never forced, so a moved store
+            # converges instead of being pinned forever.
+            print ""
+            warn "$label was installed from a different pnpm store; relinking it once and retrying the update."
+            print "" >> "$update_log"
+            env "${env_args[@]}" "$DSH_CMD" plugin --profile "$profile" -- install --frozen-lockfile 2>&1 \
+                | tee -a "$update_log"
+            if (( pipestatus[1] == 0 )); then
+                env "${env_args[@]}" "$DSH_CMD" plugin --profile "$profile" -- update "${update_args[@]}" 2>&1 \
+                    | tee -a "$update_log"
+                rc=$pipestatus[1]
+                if (( rc == 0 )); then
+                    relinked=1
+                fi
+            else
+                relink_failed=1
+            fi
+        fi
+        if (( rc != 0 )); then
+            if [ -n "$relink_failed" ]; then
+                err "the one-time relink failed for $label; the update was not retried."
+            else
+                err "plugin update failed for $label; continuing with the remaining profiles."
+            fi
+            rollback_hint "$home" "$profile" "$profile_dir"
+            SUMMARY+=("update-failed $label")
+            DFAILED=1
+            continue
+        fi
+
+        # A healed profile is still an "ok", but saying so hides that the run
+        # moved its node_modules to another store; the marker keeps the
+        # summary honest without turning a recovered run into a failure.
+        if [ -n "$relinked" ]; then
+            SUMMARY+=("ok (relinked) $label")
+        else
+            SUMMARY+=("ok            $label")
+        fi
+    done
+fi
+
+# ── linked local sources ────────────────────────────────────────────────────
+# A linked bundle is the one dependency pnpm cannot refresh: its build product
+# lives in the checkout, not in the profile, and the checkout's dist/ is
+# gitignored. Pulling the sources is pull-all's job (moving a submodule commit
+# here would change the superproject's git state); rebuilding them is ours. The
+# helper is a no-op while dist/ is newer than the sources, so the common case is
+# a stat pass per distinct checkout, not a build.
+if (( DO_PLUGINS && ${#PI_TUI_LINKS} )); then
+    for pi_tui_source in "${(@k)PI_TUI_LINKS}"; do
+        print ""
+        print "==> linked @xmoon76/dsh-pi-tui: $pi_tui_source"
+        if [ "$MODE" = check ]; then
+            # 0 current, 1 rebuild due, anything else is a broken checkout — which
+            # must fail the check rather than masquerade as "just stale".
+            "$SCRIPT_DIR/dsh-pi-tui-build" --check "$pi_tui_source"
+            rc=$?
+            if (( rc == 0 )); then
+                SUMMARY+=("tui-current  $pi_tui_source")
+            elif (( rc == 1 )); then
+                SUMMARY+=("tui-stale    $pi_tui_source")
+            else
+                SUMMARY+=("check-failed $pi_tui_source")
+                DFAILED=1
+            fi
+        elif "$SCRIPT_DIR/dsh-pi-tui-build" "$pi_tui_source"; then
+            SUMMARY+=("tui-ok       $pi_tui_source")
+        else
+            err "the linked dsh-pi-tui at $pi_tui_source could not be rebuilt; profiles using it keep the previous build."
+            SUMMARY+=("tui-failed   $pi_tui_source")
+            DFAILED=1
+        fi
+    done
+fi
+
+print ""
+print "=== dsh-upgrade summary ==="
+if (( DO_DSH )); then
+    if [ "$MODE" = update ]; then
+        print "dsh:     ${DSH_NPM_BEFORE:-not installed} -> ${DSH_AFTER:-unknown} (${DSH_CMD:-not on PATH})"
+    else
+        print "dsh:     ${DSH_BEFORE:-not installed} (latest: ${LATEST_DSH:-unknown})"
+    fi
+else
+    print "dsh:     skipped (--no-dsh)"
+fi
+print "homes:   $HOMES_ROOT"
+if (( DO_PLUGINS )); then
+    if [ "$MODE" = update ] && (( ${#profiles} > 0 )); then
+        print "backups: $BACKUP_ROOT/$STAMP"
+    fi
+    if (( ${#SUMMARY} )); then
+        print -l -- "${SUMMARY[@]}"
+    else
+        print "profiles: none"
+    fi
+else
+    print "plugins: skipped (--no-plugins)"
+fi
+
+if [ "$MODE" = update ]; then
+    if [ -n "$DSH_NPM_BEFORE" ] && [ "$DSH_NPM_BEFORE" != "$DSH_AFTER" ]; then
+        print ""
+        print "rollback dsh: npm install -g --allow-scripts=$ALLOW_SCRIPTS @deepseek-ai/dsh@$DSH_NPM_BEFORE"
+    fi
+    if (( DO_PLUGINS )); then
+        print ""
+        print "note: link: plugins follow their third-party/ checkout; pull-all refreshes it, and the linked TUI bundle is rebuilt here whenever its build is stale."
+        print "note: the Blender plugin loads from third-party/dsh-blender-plugin by path; rebuild it after a dsh upgrade."
+        print "note: an incompatible plugin is refused at boot; review dsh's allow-version command before granting it."
+    fi
+fi
+
+if (( DFAILED )); then
+    exit 1
+fi
+exit 0

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Idempotent: submodules -> build bin/{ai-bridge,ma} (then cargo clean) ->
-# fetch the latest photocraft-cli (macOS only; skipped elsewhere) -> create var/
-# and dsh-home/ -> report PATH status.
+# Idempotent: submodules -> build the linked dsh-pi-tui checkout (dist/ is
+# gitignored, so a fresh clone has no TUI build) -> build bin/{ai-bridge,ma}
+# (then cargo clean) -> fetch the latest photocraft-cli (macOS only; skipped
+# elsewhere) -> create var/ and dsh-home/ -> report PATH status.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd "$ROOT"
@@ -44,6 +45,18 @@ resolve_photocraft_version() {
 if [ -f .gitmodules ]; then
     say "initializing submodules"
     git submodule update --init --recursive
+fi
+
+# The launchers link the TUI bundle from this checkout (ADR-0013) instead of
+# installing the published package, so dist/ has to exist before the first
+# launch. Idempotent: bin/dsh-pi-tui-build is a stat pass once dist/ is current.
+if [ -f third-party/dsh-pi-tui/package.json ]; then
+    command -v pnpm >/dev/null \
+        || die "pnpm not found — needed to build third-party/dsh-pi-tui: npm install -g --allow-scripts=pnpm pnpm"
+    say "building dsh-pi-tui (the checkout the launchers link)"
+    bin/dsh-pi-tui-build || die "dsh-pi-tui build failed; fix it and re-run install.sh"
+else
+    say "warning: third-party/dsh-pi-tui is missing — launchers fall back to the published package"
 fi
 
 build_rust() { # <subdir> <bin>

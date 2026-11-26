@@ -87,6 +87,13 @@
 #                        it at a github: spec once the plugin is published).
 #   DSH_PERMISSION_RULES_PKG     optional. Installed package name
 #                        (default @darklinden/dsh-permission-rules).
+#   DSH_PI_TUI_SOURCE    optional. Local dsh-pi-tui checkout every profile links
+#                        the TUI bundle from (default <repo>/third-party/dsh-pi-tui,
+#                        ADR-0013). `npm` uses the published package instead; a
+#                        missing checkout falls back to it with a warning, and a
+#                        failed build uses the previous build when one exists —
+#                        only an unlinked profile goes back to the published
+#                        package.
 #
 # Permission rules are a policy aid, not the isolation boundary: the tables run
 # regular expressions over tool arguments, while the sandbox and the approval
@@ -195,9 +202,84 @@ if ! command -v dsh >/dev/null 2>&1; then
     exit 1
 fi
 DSH_HOME_DIR="$DSH_HOME"
-if [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
+PROFILE_DIR="$DSH_HOME_DIR/profiles/$PROFILE"
+
+# ── dsh-pi-tui source ───────────────────────────────────────────────────────
+# The TUI bundle is a profile dependency, and this launcher links the one in
+# third-party/dsh-pi-tui instead of installing the published package (ADR-0013):
+# a TUI change is then a checkout edit plus a rebuild, with no registry release
+# in the loop. That checkout is source only — dist/ is gitignored and absent on
+# a fresh clone — while the profile resolves the bundle through package.json's
+# main. bin/dsh-pi-tui-build owns the build and is a no-op once the last build is
+# newer than the sources, so the cost is paid once per edit, not per launch.
+# DSH_PI_TUI_SOURCE=npm (or a checkout that is not there) keeps the published
+# package. A failed build falls back to it only when no profile links the
+# checkout, and to the previous build when one does — a link to an unbuilt
+# checkout cannot boot at all.
+PI_TUI_PKG="@xmoon76/dsh-pi-tui"
+PI_TUI_SOURCE="${DSH_PI_TUI_SOURCE:-$ROOT/third-party/dsh-pi-tui}"
+PI_TUI_MODE=registry
+PI_TUI_STATE=registry
+PI_TUI_DECL=""
+
+# What the profile declares: "link:<absolute path>" once linked, a semver range
+# while it still holds the published package, nothing when the row is absent.
+pi_tui_declared() {
+    [ -f "$PROFILE_DIR/package.json" ] || return 1
+    node -e 'const path = require("node:path"), fs = require("node:fs"); const m = require(process.argv[1]); const d = m.dependencies ?? {}; let v = d[process.argv[2]]; if (typeof v !== "string") process.exit(1); if (v.startsWith("link:")) { let p = path.resolve(path.dirname(process.argv[1]), v.slice(5)); try { p = fs.realpathSync(p) } catch {} v = "link:" + p } process.stdout.write(v)' \
+        "$PROFILE_DIR/package.json" "$PI_TUI_PKG"
+}
+# The entry point the profile will actually load, read from the checkout's own
+# package.json (a hardcoded dist/index.mjs would go stale if upstream moved it).
+pi_tui_dist() {
+    local main
+    main=$(node -e 'const v = require(process.argv[1]).main; if (typeof v === "string") process.stdout.write(v)' \
+        "$1/package.json" 2>/dev/null) || main=""
+    print -r -- "$1/${main:-dist/index.mjs}"
+}
+
+# A matching declaration is not enough: a half-finished `dsh plugin add` leaves
+# the previous copy in node_modules, and booting that would be exactly the drift
+# this block exists to prevent.
+pi_tui_resolved() {
+    local entry="$PROFILE_DIR/node_modules/$PI_TUI_PKG" target want
+    [ -e "$entry" ] || return 1
+    target="$(realpath "$entry" 2>/dev/null)" || return 1
+    want="$(realpath "$1" 2>/dev/null)" || return 1
+    [ "$target" = "$want" ]
+}
+PI_TUI_DECL="$(pi_tui_declared 2>/dev/null)" || PI_TUI_DECL=""
+
+if [ "$PI_TUI_SOURCE" = "npm" ]; then
+    PI_TUI_SOURCE=""
+elif [ -f "$PI_TUI_SOURCE/package.json" ]; then
+    PI_TUI_SOURCE="${PI_TUI_SOURCE:A}"
+    if "$SCRIPT_DIR/dsh-pi-tui-build" --check "$PI_TUI_SOURCE" >/dev/null 2>&1 \
+       || "$SCRIPT_DIR/dsh-pi-tui-build" "$PI_TUI_SOURCE"; then
+        PI_TUI_MODE=local
+    elif [ -f "$(pi_tui_dist "$PI_TUI_SOURCE")" ]; then
+        # The helper restores the dist/ it replaced, so a broken source edit
+        # still leaves a bootable bundle; say so instead of refusing to start.
+        echo "dsh-pi-tui: WARNING — rebuild failed; booting the previous build of ${(q)PI_TUI_SOURCE}." >&2
+        PI_TUI_MODE=local
+    elif [ "$PI_TUI_DECL" = "link:$PI_TUI_SOURCE" ]; then
+        die "the profile links ${(q)PI_TUI_SOURCE}, but it cannot be built and has no previous build; fix it or move the profile back to the published package."
+    else
+        echo "dsh-pi-tui: WARNING — cannot build ${(q)PI_TUI_SOURCE}; using the published package." >&2
+        PI_TUI_SOURCE=""
+    fi
+else
+    [ -z "$PI_TUI_SOURCE" ] || echo "dsh-pi-tui: no checkout at ${(q)PI_TUI_SOURCE} — using the published package." >&2
+    PI_TUI_SOURCE=""
+fi
+
+if [ ! -d "$PROFILE_DIR" ]; then
     echo "dsh profile '$PROFILE' is not installed under $DSH_HOME_DIR. Install dsh-pi-tui first:"
-    echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add @xmoon76/dsh-pi-tui@latest"
+    if [ "$PI_TUI_MODE" = local ]; then
+        echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add ${(q)PI_TUI_SOURCE}"
+    else
+        echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add $PI_TUI_PKG@latest"
+    fi
     # `dsh plugin` forwards to pnpm inside the profile directory and exits 127
     # when pnpm is absent, so name that prerequisite here instead of letting the
     # install fail on it. Only when pnpm really is missing: a machine that has
@@ -209,6 +291,41 @@ if [ ! -d "$DSH_HOME_DIR/profiles/$PROFILE" ]; then
     exit 1
 fi
 
+# ── link the TUI bundle to the checkout ─────────────────────────────────────
+# Install-once, like the rule plugin below: a profile that declares the published
+# range, another checkout, or a link that no longer resolves is moved by one
+# `dsh plugin add`. A declaration that matches AND resolves costs a stat call and
+# prints nothing. A failed migration keeps what is installed: the published copy
+# still boots, only without the local changes.
+if [ "$PI_TUI_MODE" = local ]; then
+    if [ "$PI_TUI_DECL" != "link:$PI_TUI_SOURCE" ] || ! pi_tui_resolved "$PI_TUI_SOURCE"; then
+        echo "dsh-pi-tui: linking $PI_TUI_PKG -> ${(q)PI_TUI_SOURCE} ..."
+        if DSH_HOME="$DSH_HOME_DIR" dsh plugin --profile "$PROFILE" -- add "$PI_TUI_SOURCE"; then
+            PI_TUI_DECL="$(pi_tui_declared 2>/dev/null)" || PI_TUI_DECL=""
+        else
+            echo "dsh-pi-tui: WARNING — link failed; keeping $PI_TUI_PKG ${PI_TUI_DECL:-as installed}" >&2
+        fi
+    fi
+    if [ "$PI_TUI_DECL" = "link:$PI_TUI_SOURCE" ] && pi_tui_resolved "$PI_TUI_SOURCE"; then
+        PI_TUI_STATE=linked
+    fi
+elif [ -n "$PI_TUI_DECL" ] && [[ "$PI_TUI_DECL" == link:* ]]; then
+    # Only reachable with DSH_PI_TUI_SOURCE=npm against an already-linked
+    # profile: the link still wins at boot, so say how to undo it instead of
+    # pretending the launcher switched back.
+    echo "dsh-pi-tui: WARNING — the profile still links ${PI_TUI_DECL#link:}; move it back to the published package with:" >&2
+    echo "  DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add $PI_TUI_PKG@latest" >&2
+fi
+
+# A link the profile declares but cannot resolve is the one state a boot cannot
+# explain: node_modules may still hold the previous copy, so the session would
+# look right while running the old TUI. Refuse, and name the ways out.
+if [[ "$PI_TUI_DECL" == link:* ]]; then
+    linked_to="${PI_TUI_DECL#link:}"
+    pi_tui_resolved "$linked_to" \
+        || die "the profile links ${(q)linked_to}, but it does not resolve to that checkout; reinstall the published package (DSH_HOME=\"$DSH_HOME_DIR\" dsh plugin --profile $PROFILE -- add $PI_TUI_PKG@latest) or restore the checkout and re-run this launcher."
+fi
+
 # ── permission rules ────────────────────────────────────────────────────────
 # The rule plugin is a profile dependency (installed once, like dsh-purge in
 # dsh-jailbreak); the rule table is a tracked patch asset mounted as a second
@@ -216,7 +333,6 @@ fi
 # republish. Checked right after the profile exists, because `dsh plugin` would
 # otherwise initialize a missing profile from the generic template — a home
 # that passes the check above but boots no TUI.
-PROFILE_DIR="$DSH_HOME_DIR/profiles/$PROFILE"
 PERMISSION_RULES_PATCH="${DSH_PERMISSION_RULES_PATCH:-$ROOT/assets/permission-rules.patch.yml}"
 PERMISSION_RULES_SOURCE="${DSH_PERMISSION_RULES_SOURCE:-$ROOT/third-party/dsh-permission-rules}"
 PERMISSION_RULES_PKG="${DSH_PERMISSION_RULES_PKG:-@darklinden/dsh-permission-rules}"
@@ -452,6 +568,14 @@ fi
 
 echo "Profile: $PROFILE"
 echo "Home: $DSH_HOME_DIR"
+if [ "$PI_TUI_STATE" = "linked" ]; then
+    echo "TUI: $PI_TUI_PKG <- $PI_TUI_SOURCE"
+elif [[ "$PI_TUI_DECL" == link:* ]]; then
+    # DSH_PI_TUI_SOURCE=npm against a linked profile: the link still wins at boot.
+    echo "TUI: $PI_TUI_PKG <- ${PI_TUI_DECL#link:} (declared; the link still wins)"
+else
+    echo "TUI: $PI_TUI_PKG (published package)"
+fi
 echo "Telemetry: disabled (DSH_TELEMETRY_DISABLED=1)"
 echo "Route: dsa/$DDD_MODEL via $DDD_PROTOCOL @ $DDD_BASE_URL (context $DDD_CONTEXT_WINDOW)"
 echo "Overlay: $OVERLAY"

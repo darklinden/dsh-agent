@@ -109,6 +109,11 @@ the purge prompt fix, the Photocraft MCP server, the Blender plugin.
 **plugin source** — what that `add` installs. Kept in `dsh-jailbreak` as
 `PLUGIN_SOURCE`, defaulting to the fork of the purge plugin (ADR-0007).
 
+**linked bundle** — a profile dependency declared as `link:<path>` instead of a
+registry range, so the profile runs that checkout's build. `@xmoon76/dsh-pi-tui` is
+linked from `third-party/dsh-pi-tui` (ADR-0013): `pull-all` refreshes the sources, and
+`dsh-pi-tui-build` rebuilds the gitignored `dist/` the profile actually loads.
+
 **AGENTS template** — `assets/global-AGENTS.md`: the one copy of the user-global
 instructions. A DSH home never keeps a copy of its own.
 

@@ -1,0 +1,310 @@
+#!/usr/bin/env zsh
+
+# dsh-pi-tui-build [--check] [--force] [source-dir] — build the local TUI bundle.
+#
+# Why this exists: the launchers link @xmoon76/dsh-pi-tui from
+# third-party/dsh-pi-tui (ADR-0013) instead of installing the published package,
+# so a TUI change is a checkout edit. That checkout is source only — dist/ is
+# gitignored and absent on a fresh clone — while the profile resolves the bundle
+# through package.json's "main". A link to an unbuilt checkout therefore boots
+# nothing, and a link to a stale one silently boots the previous code. This
+# command is the one place that closes both gaps.
+#
+# Callers: bin/dsh-agent (pre-flight, before the profile check), bin/dsh-upgrade
+# (after the plugin step, for every profile that links the checkout) and
+# install.sh (fresh clone). Safe to run by hand after editing third-party sources.
+#
+# Staleness is a stamp, not just a file: dist/.dsh-build-stamp is written only
+# after a build completes, so an interrupted build (tsdown cleans dist/ first)
+# never looks current. The stamp must be newer than package.json,
+# pnpm-lock.yaml, pnpm-workspace.yaml, tsdown.config.ts, src/, generated/ and
+# every packages/*/src tree — files and directories alike, so a deleted source
+# also forces a rebuild. node_modules/ and dist/ are pruned, so a finished build
+# never looks stale to itself. --force skips the test; --check reports and
+# changes nothing.
+#
+# Dependencies are re-synced on every build (`pnpm install --frozen-lockfile`,
+# idempotent and quick when current) instead of guessing from metadata mtimes:
+# pnpm leaves node_modules/.modules.yaml alone when it has nothing to do, so a
+# manifest comparison there reports a phantom "stale" forever. A lockfile that
+# disagrees with package.json fails the build rather than being rewritten — the
+# lockfile is tracked in the checkout.
+#
+# A failed build restores the dist/ it replaced (backups/dsh-pi-tui/ at the repo
+# root) instead of leaving the profile with no bundle at all. A lock directory
+# under $TMPDIR keeps a launch and dsh-upgrade from building the same checkout
+# concurrently.
+#
+# The checkout pins pnpm through packageManager (upstream reproducibility). When
+# that pin cannot be materialized — a read-only HOME, a sandboxed HOME — pnpm
+# fails with ERR_PNPM_PRIVATE_INSTALL before doing any work; the build is then
+# retried once with the pnpm already on PATH, because a stale dist/ is worse than
+# an unpinned pnpm.
+#
+# Exit status: 0 up to date / built; 1 needs a build (--check) or the build
+# failed; 2 usage error or no (usable) checkout.
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+MODE=build
+FORCE=0
+SOURCE=""
+
+err() { print -u2 "dsh-pi-tui-build: $*" }
+
+usage() {
+    cat <<'EOF'
+Usage: dsh-pi-tui-build [options] [source-dir]
+
+Build the local dsh-pi-tui checkout that the profiles link to.
+
+Options:
+  --check        report whether a build is needed; build nothing
+  --force        build even when dist/ looks current
+  -h, --help     show this help
+
+Arguments:
+  source-dir     checkout to build (default $DSH_PI_TUI_SOURCE, else
+                 <repo>/third-party/dsh-pi-tui)
+
+Exit status: 0 up to date / built; 1 build needed (--check) or failed;
+2 usage error or no usable checkout.
+EOF
+}
+
+while (( $# )); do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --check) MODE=check ;;
+        --force) FORCE=1 ;;
+        -*)
+            err "unknown option '$1'"
+            usage >&2
+            exit 2
+            ;;
+        *)
+            if [ -n "$SOURCE" ]; then
+                err "unexpected argument '$1'"
+                usage >&2
+                exit 2
+            fi
+            SOURCE="$1"
+            ;;
+    esac
+    shift
+done
+
+if [ "$MODE" = check ] && (( FORCE )); then
+    err "--force has no meaning with --check"
+    exit 2
+fi
+
+SOURCE="${SOURCE:-${DSH_PI_TUI_SOURCE:-$ROOT/third-party/dsh-pi-tui}}"
+if [ ! -f "$SOURCE/package.json" ]; then
+    err "no dsh-pi-tui checkout at $SOURCE (missing package.json)."
+    err "  a fresh clone needs: git submodule update --init third-party/dsh-pi-tui"
+    exit 2
+fi
+SOURCE="${SOURCE:A}"
+PKG="$SOURCE/package.json"
+
+pkg_field() { # <field> [fallback]
+    local v
+    v=$(node -e 'const v = require(process.argv[1])[process.argv[2]]; if (typeof v === "string") process.stdout.write(v)' \
+        "$PKG" "$1" 2>/dev/null) || v=""
+    print -r -- "${v:-${2:-}}"
+}
+
+PKG_NAME="$(pkg_field name)"
+if [ "$PKG_NAME" != "@xmoon76/dsh-pi-tui" ]; then
+    err "$SOURCE is not the TUI bundle (package name is '${PKG_NAME:-unknown}')."
+    exit 2
+fi
+DIST="$SOURCE/$(pkg_field main dist/index.mjs)"
+STAMP="$SOURCE/dist/.dsh-build-stamp"
+
+pkg_version() {
+    local v
+    v="$(pkg_field version)"
+    print -r -- "${v:-unknown}"
+}
+
+# Prints why a build is needed, or nothing when dist/ is current. Only the inputs
+# that end up inside dist/ are considered: editing docs or tests must not force a
+# rebuild.
+stale_reason() {
+    if [ ! -f "$STAMP" ] || [ ! -f "$DIST" ]; then
+        print -r -- "no completed build (${DIST#$SOURCE/} or its stamp is missing)"
+        return 0
+    fi
+    if [ ! -f "$SOURCE/node_modules/.modules.yaml" ]; then
+        print -r -- "dependencies are not installed"
+        return 0
+    fi
+    local -a roots inputs
+    roots=("$PKG" "$SOURCE/pnpm-lock.yaml" "$SOURCE/pnpm-workspace.yaml" \
+           "$SOURCE/tsdown.config.ts" "$SOURCE/src" "$SOURCE/generated")
+    roots+=("$SOURCE"/packages/*/src(N))
+    inputs=()
+    local p
+    for p in "${roots[@]}"; do
+        [ -e "$p" ] && inputs+=("$p")
+    done
+    local newer rc
+    # -newer without -type so an added or deleted source (a directory mtime
+    # change) also counts; a scanned tree that cannot be read is stale, never
+    # "current".
+    newer=$(find "${inputs[@]}" \( -name node_modules -o -name dist -o -name .git \) -prune \
+        -o -newer "$STAMP" -print -quit 2>/dev/null)
+    rc=$?
+    if (( rc != 0 )); then
+        print -r -- "the source tree could not be scanned (find exit $rc)"
+        return 0
+    fi
+    if [ -n "$newer" ]; then
+        print -r -- "$newer is newer than the last build"
+        return 0
+    fi
+    return 1
+}
+
+# Buffered on purpose: the build prints thousands of lines, and only a failure
+# needs them. The pin fallback is described in the header.
+pnpm_run() {
+    local out
+    if out=$(pnpm "$@" 2>&1); then
+        return 0
+    fi
+    if [[ "$out" == *ERR_PNPM_PRIVATE_INSTALL* ]]; then
+        err "the pinned pnpm could not be installed here; retrying with the pnpm on PATH."
+        if out=$(npm_config_manage_package_manager_versions=false pnpm "$@" 2>&1); then
+            return 0
+        fi
+    fi
+    print -u2 -r -- "$out"
+    return 1
+}
+
+print "dsh-pi-tui-build: $SOURCE"
+reason=""
+(( FORCE )) || reason=$(stale_reason)
+if (( ! FORCE )) && [ -z "$reason" ]; then
+    print "  up to date (v$(pkg_version))"
+    exit 0
+fi
+if [ "$MODE" = check ]; then
+    print "  needs a build: $reason"
+    exit 1
+fi
+
+cd "$SOURCE" || {
+    err "cannot enter $SOURCE"
+    exit 1
+}
+if ! command -v pnpm >/dev/null 2>&1; then
+    err "pnpm is not on PATH — 'dsh plugin' and this build both need it."
+    err "  install it first: npm install -g --allow-scripts=pnpm pnpm"
+    exit 1
+fi
+
+# One build per checkout: a launcher and dsh-upgrade can race on the same dist/.
+# The lock is a directory holding the owner's pid, under a fixed path per
+# checkout. A dead owner or a lock older than 30 minutes is taken over, so a
+# killed build never blocks the next one — and nothing has to be deleted to
+# release it, which also keeps this script clear of the rm/rmdir guard.
+lock_dir="${TMPDIR:-/tmp}/dsh-pi-tui-build$(print -r -- "$SOURCE" | cksum | awk '{print $1}').lock"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+    owner="$(cat "$lock_dir/pid" 2>/dev/null)"
+    live=0
+    # A live owner keeps the lock even when the build is slow; only a dead or
+    # missing pid is taken over. The six-hour ceiling is the escape hatch for a
+    # pid that was recycled after the build was killed.
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null \
+       && [ -z "$(find "$lock_dir" -prune -mmin +360 2>/dev/null)" ]; then
+        live=1
+    fi
+    if (( live )); then
+        if [ -f "$STAMP" ] && [ -f "$DIST" ]; then
+            print "  another build is running (pid $owner); using the existing build (v$(pkg_version))"
+            exit 0
+        fi
+        err "another build is starting $SOURCE (pid $owner); retry when it finishes."
+        exit 1
+    fi
+fi
+print -r -- "$$" > "$lock_dir/pid" 2>/dev/null
+
+# tsdown cleans dist/ before writing, so a failed build would leave the profile
+# linking a checkout with no bundle. Keep the previous dist/ and put it back.
+restore=""
+if [ -d "$SOURCE/dist" ]; then
+    restore="$ROOT/backups/dsh-pi-tui/$(date +%Y%m%dT%H%M%S).$$"
+    if mkdir -p "$ROOT/backups/dsh-pi-tui" 2>/dev/null && cp -R "$SOURCE/dist" "$restore" 2>/dev/null; then
+        : # restoring is best-effort; a failure here only costs the old build
+    else
+        restore=""
+        print -u2 "dsh-pi-tui-build: WARNING — could not keep the previous build; a failed build will leave dist/ incomplete."
+    fi
+fi
+
+failed() {
+    if [ -n "$restore" ] && [ -d "$restore" ]; then
+        # Move the failed tree out before restoring: copying the snapshot over it
+        # would leave the files the broken build wrote as a mixed tree.
+        local broken=""
+        if [ -d "$SOURCE/dist" ]; then
+            broken="$ROOT/backups/dsh-pi-tui/broken.$(date +%Y%m%dT%H%M%S).$$"
+            mkdir -p "$ROOT/backups/dsh-pi-tui" 2>/dev/null
+            mv "$SOURCE/dist" "$broken" 2>/dev/null || broken=""
+        fi
+        if mkdir -p "$SOURCE/dist" && cp -R "$restore/." "$SOURCE/dist/"; then
+            print "  previous build restored (v$(pkg_version))"
+        else
+            err "could not restore the previous build from $restore"
+        fi
+        [ -n "$broken" ] && "$ROOT/bin/trash" "$broken" >/dev/null 2>&1
+    fi
+    exit 1
+}
+
+print "  syncing dependencies (pnpm install --frozen-lockfile)"
+pnpm_run install --frozen-lockfile || {
+    err "pnpm install failed in $SOURCE (the lockfile must match package.json)"
+    failed
+}
+print "  building (pnpm build) — the first run takes a couple of minutes"
+pnpm_run build || {
+    err "pnpm build failed in $SOURCE"
+    failed
+}
+if [ ! -f "$DIST" ]; then
+    err "pnpm build reported success, but $DIST is missing."
+    failed
+fi
+print -r -- "v$(pkg_version) $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAMP" || {
+    err "could not write the build stamp $STAMP"
+    exit 1
+}
+print "  built v$(pkg_version) -> ${DIST#$SOURCE/}"
+# The snapshot was only insurance for a failed build; once the new dist/ is
+# stamped it has no job. bin/trash is best-effort, but a failure is named: a
+# machine where it cannot reach the OS trash would otherwise grow
+# backups/dsh-pi-tui/ silently, one dist per rebuild.
+if [ -n "$restore" ] && ! "$ROOT/bin/trash" "$restore" >/dev/null 2>&1; then
+    print "  note: could not move the previous-build snapshot to the trash; left at ${restore#$ROOT/}"
+fi
+
+# gen:dsh-presets rewrites the tracked generated/ tree. A build that leaves it
+# modified would dirty the submodule and block pull-all, so name it here instead
+# of letting the next command discover it.
+if git -C "$SOURCE" rev-parse --git-dir >/dev/null 2>&1; then
+    changed="$(git -C "$SOURCE" status --porcelain --untracked-files=no -- generated 2>/dev/null)"
+    if [ -n "$changed" ]; then
+        print -u2 "dsh-pi-tui-build: WARNING — the build changed tracked files under generated/:"
+        print -u2 -r -- "$changed" | sed 's/^/  /'
+        print -u2 "dsh-pi-tui-build:   review and commit them; a dirty submodule blocks pull-all."
+    fi
+fi
+exit 0
