@@ -37,7 +37,7 @@ for sub in "${submodules[@]}"; do
         git push
     else
         echo "Dirty, committing ..."
-        commit
+        commit --all
         git push
     fi
 done
@@ -52,7 +52,7 @@ if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
     git push
 else
     echo "Dirty, committing ..."
-    commit
+    commit --all
     git push
 fi
 

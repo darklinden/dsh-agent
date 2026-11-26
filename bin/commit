@@ -2,6 +2,85 @@
 
 BASEDIR=$(dirname "$0")
 SCRIPT_DIR="$(realpath "${BASEDIR}")"
+PROGNAME="${0:t}"
+
+usage() {
+    print "Usage: ${PROGNAME} [--staged | --all]"
+    print
+    print "Commit changes with a generated Conventional Commits message."
+    print
+    print "Options:"
+    print "  --staged    commit only the changes already staged in the index"
+    print "  --all       commit all changes in the current repo and its submodules"
+    print "              (the previous no-argument behavior)"
+    print "  -h, --help  show this help"
+    print
+    print "Run without arguments to show this help."
+}
+
+STAGED_PROMPT='You are in a git repository. Your task is to commit ONLY the changes already staged in the index.
+
+## Commit message format — Conventional Commits
+
+Every commit message MUST follow this format:
+
+    type(scope): subject
+
+    body
+
+- **type** must be one of: build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test
+- **scope** is optional (parenthesized). Use a short noun describing the area changed.
+- **subject** must be lowercase, no trailing period, describe the change concisely.
+- The entire header line (type + scope + ": " + subject) must be ≤ 72 characters.
+- Body is optional. If used, separate from subject with a blank line. Each body line ≤ 100 characters.
+- Breaking changes: add `!` after the type/scope, e.g. `feat!: drop support for X`
+- If a scope is not clearly applicable, omit it: just `type: subject`.
+
+## Steps
+
+1. Run `git rev-parse --show-toplevel` to confirm the repository root. Never go above it, and never recurse into or touch any submodule.
+2. Run `git diff --cached --name-status` to list the staged paths, then `git diff --cached` to read the staged changes. The staged index is the ONLY input for the commit message.
+3. If `git diff --cached --quiet` exits 0, nothing is staged: stop immediately. Do not create an empty commit and do not fall back to unstaged changes.
+4. Otherwise, generate one commit message from the staged diff using the Conventional Commits format above, then run `git commit -m "<message>"`. The commit must contain exactly the current staged index.
+
+CRITICAL: Never run `git add`, `git status`, or any `git submodule` command. Never use `git commit -a`, `--all`, `--amend`, `--allow-empty`, `--no-verify`, or a pathspec. Do not commit unstaged or untracked changes. Nothing outside the staged index matters: do not inspect submodules or `.gitmodules`. If the staged list contains a submodule pointer, treat it as an ordinary path; do not enter that submodule or commit inside it.'
+
+case "${1:-}" in
+    --staged)
+        if [[ $# -ne 1 ]]; then
+            usage >&2
+            exit 2
+        fi
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            print -u2 "commit --staged: not inside a git work tree"
+            exit 1
+        fi
+        if git diff --cached --quiet; then
+            print -u2 "commit --staged: nothing staged"
+            exit 0
+        fi
+        $SCRIPT_DIR/ma -r "$STAGED_PROMPT"
+        exit $?
+        ;;
+    --all)
+        if [[ $# -ne 1 ]]; then
+            usage >&2
+            exit 2
+        fi
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    "")
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
 
 $SCRIPT_DIR/ma -r "You are in a git repository. Your task is to commit all changes in the current git repo AND its submodules (downward only, never upward).
 
