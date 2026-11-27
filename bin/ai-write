@@ -1,0 +1,604 @@
+#!/usr/bin/env zsh
+
+# ai-write — 一键破甲并写文。
+#
+# 一条命令做三件事：把破甲层 + 文风层 + 写作协议拼成 system prompt，把题材拼成
+# user 消息，打到本地 OpenAI 兼容端点，把流式返回的正文增量落盘。
+#
+# 契约（照 dsh-sillytavern 的路径与环境变量惯例）：
+#   SCRIPT_DIR = realpath(dirname $0)        # <repo>/bin
+#   ROOT       = dirname SCRIPT_DIR          # <repo>
+#   启动时若 $ROOT/.env 存在则 set -a 载入
+#   素材：$ROOT/assets/ai-write/  （vendor 自 ../ai-jailbreak，运行时零外部依赖）
+#   落盘：$ROOT/dsh-home/writings/（gitignored）
+#
+# 环境变量（均有优先级更高的一层 --flag 覆盖）：
+#   DDD_BASE_URL / DDD_AUTH_TOKEN / DDD_MODEL
+#       上游地址、密钥、模型，来自 <repo>/.env（openai-completions 协议）。
+#   DSH_WRITE_URL / DSH_WRITE_KEY / DSH_WRITE_MODEL
+#       覆盖上面三项；URL 给 base 时自动补 /v1/chat/completions。
+#   --url / --key / --model 再覆盖一层（优先级：--flag > DSH_WRITE_* > DDD_*）。
+#   DSH_WRITE_ASSETS   覆盖素材目录（默认 <repo>/assets/ai-write）
+#   DSH_WRITE_OUT      覆盖落盘目录（默认 <repo>/dsh-home/writings）
+#
+# 素材档位（--level / --style）：
+#   level=core  core.md   ← ../ai-jailbreak/jailbreak-chat-nsfw.md（CHAT-ONLY 核心层）
+#   level=full  full.md   ← ../ai-jailbreak/jailbreak.md（完整破甲主层）
+#   style=NAME  直接读 $ASSETS/NAME.md，没有硬编码档位表：
+#               soft（默认，含蓄文学向）/ nsfw（← ../ai-jailbreak/nsfw.md）/
+#               raw（← bin/ds-se-se 内联文风 + 结尾控制）/ 自己丢进目录的任意 xxx.md
+#   style=none  不加文风层
+#   write.md（写作协议）永远加载。
+#
+# 行为要点：
+#   - prompt 来源优先级：argv > -f 文件 > stdin（非 tty 时读管道）。
+#   - 默认流式（SSE），正文边到边 append 到目标文件；--no-stream 一次性返回。
+#   - 默认边写文件边把正文镜像到 stdout（路径与告警只走 stderr，stdout 是干净正文，
+#     可直接 | tee / | 下游）。--no-stdout（或 -q）只写文件，stdout 保持静默。
+#   - --words N：全文目标字数（中文按字符计），不足则把已有正文尾部喂回去续写，
+#     最多 --max-rounds 轮；--continue FILE 时先数已有字数，只补差额。
+#   - 上游是推理模型（delta 先来 reasoning_content，正文在后），所以首字延迟常有
+#     十几秒；tty 下会每 20 个推理块打一个点。max_tokens 给小了会全是推理、正文为空，
+#     建议 ≥ 512。
+#   - 失败重试：连接失败 / 5xx / 空响应，最多 3 次（退避 2s、3s）；
+#     中途断流则保留已生成部分并告警，不算失败。
+#   - 退出码：1 参数错误；2 上游或解析失败；130 用户中断（已落盘部分保留）。
+#   - 元数据：正文旁写 <同名>.json（model/temp/style/rounds/chars/usage 等），
+#     --no-meta 关闭。usage 只在 --no-stream 下可信：流式没有最终 usage 块时为 null。
+#     不另建日志目录，调试信息只走 stderr（--debug）。
+
+setopt pipefail
+
+BASEDIR=$(dirname "$0")
+SCRIPT_DIR="$(realpath "${BASEDIR}")"
+ROOT="$(dirname "$SCRIPT_DIR")"
+
+if [ -f "$ROOT/.env" ]; then
+    set -a
+    . "$ROOT/.env"
+    set +a
+fi
+
+die() { print -u2 -- "ai-write: $*"; exit 1; }
+die2() { print -u2 -- "ai-write: $*"; exit 2; }
+
+usage_err() { usage >&2 }
+
+usage() {
+    cat <<'EOF'
+usage: ai-write [options] <prompt...>
+       ai-write [options] -f <prompt-file>
+       cat outline.md | ai-write [options]
+
+  破甲 + 文风 + 写作协议 → 本地 OpenAI 兼容端点 → 流式正文落盘
+
+选项:
+  -f, --file FILE        从文件读题材（argv 优先于 -f，-f 优先于 stdin）
+  -s, --style NAME       读素材目录下的 NAME.md（默认 soft；none 关闭）
+  -l, --level LEVEL      core|full（默认 core）
+  -o, --out PATH         输出文件（默认 <repo>/dsh-home/writings/<时间戳>-<slug>.md）
+      --stdout           正文镜像到 stdout（默认开，留存只为兼容）
+  -q, --quiet, --no-stdout
+                         只写文件，不在 stdout 输出正文
+      --stream           流式（默认开）
+      --no-stream        非流式，一次拿完
+      --temp N           temperature（默认 1.3，上限 2.0）
+      --top-p N          top_p（默认 0.95）
+      --penalty N        frequency_penalty（默认 0.3，0 关闭）
+      --presence N       presence_penalty（默认 0.1）
+      --max-tokens N     单轮输出上限（默认 4096）
+      --words N          全文目标字数，自动续写补足
+      --max-rounds N     续写轮数上限（默认 4）
+      --continue FILE    从已有正文续写；未给 -o 时直接追加到该文件
+      --title T          标题：进 slug，并要求正文首行输出「# T」
+      --model M          覆盖模型
+      --engine api|ma    api=curl 直连（默认）；ma=透传 ma -r（输出可能含 agent 噪声）
+      --no-meta          不写 <同名>.json 元数据
+      --dry-run          只拼请求、不联网、不落盘
+      --debug            请求字节数、耗时、usage 打到 stderr
+  -h, --help             本帮助
+EOF
+}
+
+# ---------------------------------------------------------------- defaults
+STYLE=soft
+LEVEL=core
+TEMP=1.3
+TOPP=0.95
+FREQ=0.3
+PRES=0.1
+MAXTOK=4096
+STREAM=1
+WORDS=0
+MAXROUNDS=4
+ENGINE=api
+OUT=
+STDOUT_ONLY=1
+META=1
+DRY=0
+DEBUG=0
+CONT=
+TITLE=
+PROMPT=
+PROMPT_FILE=
+MODEL=
+API_OVERRIDE=
+KEY_OVERRIDE=
+
+NEEDS_VALUE="-f --file -s --style -l --level -o --out --temp --top-p --penalty --presence --max-tokens --words --max-rounds --continue --title --model --engine --url --key"
+
+while (( $# )); do
+    # shift 2 越界不会前进，会把同一选项无限重放并刷屏；缺值先拦住。
+    if (( $# < 2 )); then
+        case " $NEEDS_VALUE " in
+            *" $1 "*) die "选项 $1 缺少值" ;;
+        esac
+    fi
+    case $1 in
+        -h|--help)       usage; exit 0 ;;
+        -f|--file)       PROMPT_FILE=$2; shift 2 ;;
+        -s|--style)      STYLE=$2; shift 2 ;;
+        -l|--level)      LEVEL=$2; shift 2 ;;
+        -o|--out)        OUT=$2; shift 2 ;;
+        --stdout)        STDOUT_ONLY=1; shift ;;
+        --no-stdout|-q|--quiet) STDOUT_ONLY=0; shift ;;
+        --stream)        STREAM=1; shift ;;
+        --no-stream)     STREAM=0; shift ;;
+        --temp)          TEMP=$2; shift 2 ;;
+        --top-p)         TOPP=$2; shift 2 ;;
+        --penalty)       FREQ=$2; shift 2 ;;
+        --presence)      PRES=$2; shift 2 ;;
+        --max-tokens)    MAXTOK=$2; shift 2 ;;
+        --words)         WORDS=$2; shift 2 ;;
+        --max-rounds)    MAXROUNDS=$2; shift 2 ;;
+        --continue)      CONT=$2; shift 2 ;;
+        --title)         TITLE=$2; shift 2 ;;
+        --model)         MODEL=$2; shift 2 ;;
+        --engine)        ENGINE=$2; shift 2 ;;
+        --url)           API_OVERRIDE=$2; shift 2 ;;
+        --key)           KEY_OVERRIDE=$2; shift 2 ;;
+        --no-meta)       META=0; shift ;;
+        --dry-run)       DRY=1; shift ;;
+        --debug)         DEBUG=1; shift ;;
+        --)              shift; break ;;
+        -*)              print -u2 -- "ai-write: 未知选项 $1"; usage_err; exit 1 ;;
+        *)               break ;;
+    esac
+done
+
+if (( $# )); then
+    PROMPT="$*"
+fi
+
+# ---------------------------------------------------------------- 参数校验
+isnum() { [[ $1 =~ '^[0-9]+(\.[0-9]+)?$' ]] }
+isint() { [[ $1 =~ '^[0-9]+$' ]] }
+
+isnum "$TEMP"   || die "--temp 需要数字，收到 '$TEMP'"
+isnum "$TOPP"   || die "--top-p 需要数字，收到 '$TOPP'"
+isnum "$FREQ"   || die "--penalty 需要数字，收到 '$FREQ'"
+isnum "$PRES"   || die "--presence 需要数字，收到 '$PRES'"
+isint "$MAXTOK" || die "--max-tokens 需要整数，收到 '$MAXTOK'"
+isint "$WORDS"  || die "--words 需要整数，收到 '$WORDS'"
+isint "$MAXROUNDS" || die "--max-rounds 需要整数，收到 '$MAXROUNDS'"
+
+(( MAXROUNDS > 0 )) || die "--max-rounds 必须 ≥ 1"
+(( MAXTOK > 0 )) || die "--max-tokens 必须 ≥ 1"
+(( TEMP <= 2 )) || die "--temp 上限 2.0（OpenAI 兼容协议），收到 '$TEMP'"
+
+case $LEVEL in
+    core|full) ;;
+    *) die "--level 只能是 core 或 full，收到 '$LEVEL'" ;;
+esac
+case $ENGINE in
+    api|ma) ;;
+    *) die "--engine 只能是 api 或 ma，收到 '$ENGINE'" ;;
+esac
+# --style 只接受无扩展名的素材名（字母数字 _ -），防止 ../ 之类跑出素材目录。
+[[ $STYLE == none || $STYLE =~ '^[A-Za-z0-9_-]+$' ]] \
+    || die "--style 要的是素材名（无扩展名，字母数字 _ -），收到 '$STYLE'"
+
+# ---------------------------------------------------------------- prompt
+if [[ -z $PROMPT ]]; then
+    if [[ -n $PROMPT_FILE ]]; then
+        [[ -f $PROMPT_FILE ]] || die "题材文件不存在: $PROMPT_FILE"
+        PROMPT=$(<"$PROMPT_FILE")
+    elif [[ ! -t 0 ]]; then
+        PROMPT=$(cat)
+    fi
+fi
+PROMPT=${PROMPT%$'\n'}
+if [[ -z ${PROMPT//[[:space:]]/} ]]; then
+    if [[ -n $CONT ]]; then
+        PROMPT="接着已有正文往下写，推进场景，不要停在中途。"
+    else
+        print -u2 -- "ai-write: 没有题材"
+        usage_err
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------- 素材 & system
+ASSETS="${DSH_WRITE_ASSETS:-$ROOT/assets/ai-write}"
+
+SYS=
+SYSTEM_LINES=()
+add_section() {
+    local file=$1 label=$2 lines chars
+    [[ -f $file ]] || die "素材文件缺失: $file（$label）。可用 --style none 跳过文风层，或检查素材目录 $ASSETS"
+    lines=$(wc -l <"$file" | tr -d ' ')
+    chars=$(wc -m <"$file" | tr -d ' ')
+    SYS+=$'\n\n'"===== $label (${file:t}) ====="$'\n'
+    SYS+=$(<"$file")
+    SYSTEM_LINES+=("  [$label]  $file  ($lines 行, $chars 字)")
+}
+
+case $LEVEL in
+    core) add_section "$ASSETS/core.md" "core" ;;
+    full) add_section "$ASSETS/full.md" "full" ;;
+esac
+
+if [[ $STYLE != none ]]; then
+    STYLE_FILE="$ASSETS/$STYLE.md"
+    if [[ ! -f $STYLE_FILE ]]; then
+        STYLE_AVAIL=("$ASSETS"/*.md(N:t:r))
+        # 结构层不是文风档，别混进提示里
+        STYLE_AVAIL=(${STYLE_AVAIL:#(core|full|write)})
+        die "--style '$STYLE' 找不到 $STYLE_FILE；可用：${(j:, :)STYLE_AVAIL}"
+    fi
+    add_section "$STYLE_FILE" "style:$STYLE"
+fi
+
+add_section "$ASSETS/write.md" "write"
+
+# ---------------------------------------------------------------- 上游配置
+API_BASE="${API_OVERRIDE:-${DSH_WRITE_URL:-${DDD_BASE_URL:-}}}"
+[[ -n $API_BASE ]] || die "缺少上游地址：在 $ROOT/.env 里设 DDD_BASE_URL，或设 DSH_WRITE_URL"
+case $API_BASE in
+    */chat/completions) API_URL=$API_BASE ;;
+    *) API_URL="${API_BASE%/}/v1/chat/completions" ;;
+esac
+AUTH="${KEY_OVERRIDE:-${DSH_WRITE_KEY:-${DDD_AUTH_TOKEN:-}}}"
+if [[ -z $MODEL ]]; then
+    MODEL="${DSH_WRITE_MODEL:-${DDD_MODEL:-}}"
+fi
+[[ -n $MODEL ]] || die "缺少模型名：设 DDD_MODEL 或 --model"
+
+# ---------------------------------------------------------------- 路径
+OUTDIR="${DSH_WRITE_OUT:-$ROOT/dsh-home/writings}"
+
+slugify() {
+    local s=$1
+    s=${s//$'\n'/ }
+    s=${s//$'\r'/}
+    s=${s//$'\t'/ }
+    s=${s//[\/\\:*?\"<>|]/}
+    s=${s[1,20]}
+    s=${s//  / }
+    s=${s// /-}
+    [[ -n $s ]] || s=untitled
+    print -r -- "$s"
+}
+
+TS=$(date +%Y%m%d-%H%M%S)
+if [[ -n $OUT ]]; then
+    OUTFILE=$OUT
+elif [[ -n $CONT ]]; then
+    OUTFILE=$CONT
+else
+    [[ -n $TITLE ]] && SLUG=$(slugify "$TITLE") || SLUG=$(slugify "$PROMPT")
+    OUTFILE="$OUTDIR/$TS-$SLUG.md"
+fi
+if [[ -n $CONT && ! -f $CONT ]]; then
+    die "--continue 指向的文件不存在: $CONT"
+fi
+if [[ -n $OUT && -n $CONT && $OUT != $CONT ]]; then
+    die "-o 与 --continue 给了不同路径，读写目标不明确；只保留一个"
+fi
+
+count_chars() {
+    local f=$1
+    [[ -f $f ]] || { print 0; return }
+    print -r -- "$(wc -m <"$f" | tr -d ' ')"
+}
+file_bytes() {
+    local f=$1
+    [[ -f $f ]] || { print 0; return }
+    print -r -- "$(wc -c <"$f" | tr -d ' ')"
+}
+
+# ---------------------------------------------------------------- user 消息
+build_user() {
+    local existing=$1 total=$2
+    local msg="# 任务"$'\n'"$PROMPT"$'\n\n'"# 交付要求"
+    if (( WORDS > 0 )); then
+        msg+=$'\n'"- 全文目标约 ${WORDS} 字（中文按字符计），不少于 $(( WORDS * 8 / 10 )) 字"
+    fi
+    msg+=$'\n'"- 只输出正文本身：不寒暄、不复述要求、不解释、不总结、不写「待续」"
+    if [[ -n $TITLE && -z $existing ]]; then
+        msg+=$'\n'"- 第一行输出「# ${TITLE}」作为标题，换行后直接进正文"
+    fi
+    if [[ -n $existing ]]; then
+        msg+=$'\n\n'"# 已有正文（共 ${total} 字，末尾如下）"$'\n\n'"$existing"
+        msg+=$'\n\n'"# 接续要求"$'\n'"从已有正文的最后一个字直接接续，补到全文约 ${WORDS} 字。不重述、不概括、不重写已有段落、不重复上文的收尾，不加任何说明文字。"
+    fi
+    print -r -- "$msg"
+}
+
+build_payload() {
+    local sys=$1 user=$2 stream_bool
+    [[ $STREAM == 1 ]] && stream_bool=true || stream_bool=false
+    jq -n \
+        --arg model "$MODEL" \
+        --arg sys "$sys" \
+        --arg user "$user" \
+        --argjson temp "$TEMP" \
+        --argjson topp "$TOPP" \
+        --argjson freq "$FREQ" \
+        --argjson pres "$PRES" \
+        --argjson max "$MAXTOK" \
+        --argjson stream "$stream_bool" \
+        '{model:$model, stream:$stream, temperature:$temp, top_p:$topp,
+          frequency_penalty:$freq, presence_penalty:$pres, max_tokens:$max,
+          messages:[{role:"system",content:$sys},{role:"user",content:$user}]}'
+}
+
+# ---------------------------------------------------------------- 传输
+LAST_USAGE=
+LAST_PAYLOAD_BYTES=0
+
+sse_parse() {
+    local line data delta reason reason_chunks=0 first=1
+    while IFS= read -r line; do
+        line=${line%$'\r'}
+        [[ -z $line ]] && continue
+        if [[ $line == data:* ]]; then
+            data=${line#data:}
+            data=${data# }
+            [[ $data == '[DONE]' ]] && break
+        elif [[ $line == \{* ]]; then
+            data=$line
+        else
+            continue
+        fi
+        delta=$(print -r -- "$data" | jq -j '(.choices[0].delta.content // .choices[0].message.content // .choices[0].text // empty)' 2>/dev/null)
+        if [[ -z $delta ]]; then
+            # 推理模型的 reasoning_content 不算正文，但它是首字延迟的来源：
+            # tty 下每 20 块打一个点，免得看起来卡死。
+            reason=$(print -r -- "$data" | jq -j '(.choices[0].delta.reasoning_content // empty)' 2>/dev/null)
+            if [[ -n $reason ]]; then
+                reason_chunks=$((reason_chunks + 1))
+                (( reason_chunks % 20 == 0 )) && [[ -t 2 ]] && print -u2 -n -- "."
+            fi
+            continue
+        fi
+        if (( first )) && [[ -t 2 ]] && (( reason_chunks > 0 )); then
+            print -u2 -- ""
+        fi
+        first=0
+        if [[ -n $delta ]]; then
+            # 直接 append，不经 tee：tee 写普通文件会块缓冲，Ctrl-C 时缓冲区里的正文会丢。
+            print -rn -- "$delta" >>"$OUTFILE"
+            (( STDOUT_ONLY == 1 )) && print -rn -- "$delta"
+        fi
+    done
+}
+
+api_call_stream() {
+    local payload=$1
+    local -a hdr
+    [[ -n $AUTH ]] && hdr=(-H "Authorization: Bearer $AUTH")
+    curl -sS -N -f --connect-timeout 10 --max-time 900 -X POST "$API_URL" \
+        -H 'Content-Type: application/json' "${hdr[@]}" \
+        --data-binary "$payload" | sse_parse
+    return ${pipestatus[1]}
+}
+
+api_call_once() {
+    # 直接在父 shell 里跑（不要用 $(...) 调用），LAST_USAGE 才回得去。
+    local payload=$1 body code content
+    local -a hdr
+    [[ -n $AUTH ]] && hdr=(-H "Authorization: Bearer $AUTH")
+    body=$(curl -sS --connect-timeout 10 --max-time 900 -X POST "$API_URL" \
+        -H 'Content-Type: application/json' "${hdr[@]}" \
+        --data-binary "$payload" -w $'\n%{http_code}') || return 1
+    code=${body##*$'\n'}
+    body=${body%$'\n'*}
+    if [[ $code != 200 ]]; then
+        print -u2 -- "ai-write: 上游 HTTP $code"
+        return 1
+    fi
+    LAST_USAGE=$(print -r -- "$body" | jq -c '.usage // empty' 2>/dev/null)
+    content=$(print -r -- "$body" | jq -r '(.choices[0].message.content // .choices[0].delta.content // .choices[0].text // empty)' 2>/dev/null)
+    [[ -n $content ]] || { print -u2 -- "ai-write: 上游返回空正文"; return 1; }
+    print -rn -- "$content" >>"$OUTFILE"
+    (( STDOUT_ONLY == 1 )) && print -rn -- "$content"
+    return 0
+}
+
+# ---------------------------------------------------------------- dry-run
+if (( DRY )); then
+    print -- "# system:"
+    local line
+    for line in "${SYSTEM_LINES[@]}"; do
+        print -- "$line"
+    done
+    print -- "  (拼接后共 $(print -r -- "$SYS" | wc -c | tr -d ' ') 字节)"
+    print -- ""
+    print -- "# user:"
+    print -r -- "$(build_user "" 0)"
+    print -- ""
+    print -- "# request:"
+    [[ -n $AUTH ]] && KEY_STATE="Bearer <set>" || KEY_STATE="(empty)"
+    print -- "  url:       $API_URL"
+    print -- "  model:     $MODEL"
+    print -- "  auth:      $KEY_STATE"
+    print -- "  stream:    $STREAM"
+    print -- "  temp:      $TEMP   top_p: $TOPP   freq: $FREQ   pres: $PRES"
+    print -- "  max_tokens:$MAXTOK  words: $WORDS  rounds<=$MAXROUNDS"
+    print -- "  engine:    $ENGINE"
+    print -- "  messages:  2 (system $(print -r -- "$SYS" | wc -c | tr -d ' ')B + user $(build_user "" 0 | wc -c | tr -d ' ')B)"
+    print -- "  out:       $OUTFILE"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- 落盘准备
+mkdir -p "${OUTFILE:h}" || die "无法创建输出目录: ${OUTFILE:h}"
+if [[ -n $OUT && -f $OUT && -z $CONT ]]; then
+    die "$OUT 已存在；要接着写请用 --continue $OUT，或换一个 -o 路径"
+fi
+# 先建空文件：中断时路径一定在，"已生成内容保留在 …" 才指得着东西。
+[[ -f $OUTFILE ]] || : >"$OUTFILE"
+
+if (( WORDS > 0 && $(count_chars "$OUTFILE") >= WORDS )); then
+    print -u2 -- "ai-write: 已有 $(count_chars "$OUTFILE") 字 ≥ 目标 $WORDS，仍按 --continue 语义接续一章；不想写请勿运行"
+fi
+
+# ---------------------------------------------------------------- 中断
+on_int() {
+    # 不能在 trap 里用 $(...) 做命令替换：信号打断时 zsh 会丢掉整条 print。
+    # zstat 是内建，取字节数不fork。
+    print -u2 -- ""
+    print -u2 -- "ai-write: 中断，已生成内容保留在 $OUTFILE"
+    exit 130
+}
+trap on_int INT TERM
+
+# ---------------------------------------------------------------- 主循环
+START_AT=$(date +%s)
+rounds_done=0
+total_rounds=0
+
+while (( rounds_done < MAXROUNDS )); do
+    rounds_done=$((rounds_done + 1))
+
+    cur=$(count_chars "$OUTFILE")
+    existing=
+    if (( cur > 0 )); then
+        existing=$(tail -c 12000 -- "$OUTFILE" | iconv -f UTF-8 -t UTF-8 -c)
+    fi
+    USER_MSG=$(build_user "$existing" "$cur")
+    PAYLOAD=$(build_payload "$SYS" "$USER_MSG") || die2 "拼装请求 JSON 失败"
+
+    if [[ $ENGINE == ma ]]; then
+        command -v ma >/dev/null 2>&1 || die2 "--engine ma 需要 ma 在 PATH 上"
+        before_ma=$(file_bytes "$OUTFILE")
+        if [[ $STDOUT_ONLY == 1 ]]; then
+            ma -s "$SYS" -r "$USER_MSG" | tee -a "$OUTFILE" || die2 "ma 调用失败"
+        else
+            ma -s "$SYS" -r "$USER_MSG" | tee -a "$OUTFILE" >/dev/null || die2 "ma 调用失败"
+        fi
+        if (( $(file_bytes "$OUTFILE") <= before_ma )); then
+            die2 "ma 没有产出正文（零字节增长）"
+        fi
+        total_rounds=$((total_rounds + 1))
+    else
+        attempt=1
+        while :; do
+            before=$(file_bytes "$OUTFILE")
+            rc=0
+            LAST_PAYLOAD_BYTES=${#PAYLOAD}
+            if [[ $STREAM == 1 ]]; then
+                api_call_stream "$PAYLOAD" || rc=$?
+            else
+                api_call_once "$PAYLOAD" || rc=$?
+            fi
+            after=$(file_bytes "$OUTFILE")
+
+            if (( rc == 0 && after > before )); then
+                break
+            fi
+            if (( after > before )); then
+                print -u2 -- "ai-write: 上游中途断开（rc=$rc），已保留已生成部分"
+                break
+            fi
+            if (( attempt >= 3 )); then
+                die2 "上游调用失败（重试 3 次仍无正文，rc=$rc）；已落盘 $(count_chars "$OUTFILE") 字"
+            fi
+            attempt=$((attempt + 1))
+            print -u2 -- "ai-write: 第 $attempt 次尝试…"
+            sleep $((attempt))
+        done
+        total_rounds=$((total_rounds + 1))
+    fi
+
+    now=$(count_chars "$OUTFILE")
+    if (( WORDS <= 0 || now >= WORDS || rounds_done >= MAXROUNDS )); then
+        break
+    fi
+    print -u2 -- "ai-write: 已写 $now/$WORDS 字，续写第 $((rounds_done + 1)) 轮"
+done
+
+# ---------------------------------------------------------------- 收尾
+# 标题归一：--title 是权威的。模型常自拟标题、或把正文直接粘在标题后面，
+# 这里统一收敛成「# 标题 + 空行 + 正文」，且只保留一个标题行。
+if [[ -n $TITLE ]]; then
+    body_text=$(<"$OUTFILE")
+    prefix="# $TITLE"
+    if [[ $body_text == *$'\n'* ]]; then
+        first=${body_text%%$'\n'*}
+        rest=${body_text#*$'\n'}
+    else
+        first=$body_text
+        rest=
+    fi
+    if [[ $first == "$prefix"* ]]; then
+        rest=${first#"$prefix"}$'\n'"$rest"
+        first=$prefix
+    elif [[ $first == '#'* && ${#first} -le 40 ]]; then
+        first=$prefix
+    else
+        # 首行不是标题（模型直接开写，或标题与正文粘成一行）：整篇前补标题。
+        rest=$body_text
+        first=$prefix
+    fi
+    while [[ $rest == $'\n'* ]]; do rest=${rest#$'\n'}; done
+    print -rn -- "$first"$'\n\n'"$rest" >"$OUTFILE"
+fi
+
+ELAPSED=$(( $(date +%s) - START_AT ))
+FINAL_CHARS=$(count_chars "$OUTFILE")
+
+if (( META == 1 )); then
+    META_PATH="${OUTFILE:r}.json"
+    # -o out.json 时 ${OUTFILE:r} 仍是 out，但 -o 无扩展名时 :r 会把目录里的点也吃掉；
+    # 两种情况都收敛到「正文旁边、绝不等于正文」。
+    [[ $META_PATH == "$OUTFILE" ]] && META_PATH="${OUTFILE}.meta.json"
+    [[ ${META_PATH:h} == ${OUTFILE:h} ]] || META_PATH="${OUTFILE:h}/${OUTFILE:t:r}.json"
+    [[ $META_PATH == "$OUTFILE" ]] && META_PATH="${OUTFILE}.meta.json"
+    jq -n \
+        --arg model "$MODEL" \
+        --arg style "$STYLE" \
+        --arg level "$LEVEL" \
+        --arg engine "$ENGINE" \
+        --arg temp "$TEMP" \
+        --arg topp "$TOPP" \
+        --arg freq "$FREQ" \
+        --arg pres "$PRES" \
+        --argjson stream "$([[ $STREAM == 1 ]] && print true || print false)" \
+        --argjson max_tokens "$MAXTOK" \
+        --argjson words_target "$WORDS" \
+        --argjson rounds "$total_rounds" \
+        --argjson chars "$FINAL_CHARS" \
+        --argjson elapsed_s "$ELAPSED" \
+        --arg prompt_sha "$(print -r -- "$PROMPT" | shasum -a 256 | cut -d' ' -f1)" \
+        --arg out "$OUTFILE" \
+        --argjson usage "${LAST_USAGE:-null}" \
+        '{model:$model, style:$style, level:$level, engine:$engine,
+          temperature:$temp, top_p:$topp, frequency_penalty:$freq, presence_penalty:$pres,
+          stream:$stream, max_tokens:$max_tokens, words_target:$words_target,
+          rounds:$rounds, chars:$chars, elapsed_s:$elapsed_s,
+          prompt_sha256:$prompt_sha, out:$out, usage:$usage}' >"$META_PATH" \
+        || print -u2 -- "ai-write: 元数据写入失败: $META_PATH"
+fi
+
+if (( DEBUG )); then
+    print -u2 -- "ai-write[debug]: rounds=$total_rounds chars=$FINAL_CHARS elapsed=${ELAPSED}s payload_last=${LAST_PAYLOAD_BYTES:-0}B usage=${LAST_USAGE:-none} out=$OUTFILE"
+fi
+
+if (( WORDS > 0 && FINAL_CHARS < WORDS )); then
+    print -u2 -- "ai-write: 未达目标字数（$FINAL_CHARS/$WORDS），已按最大轮数停止"
+fi
+
+print -u2 -- "ai-write: $FINAL_CHARS 字 → $OUTFILE"
+exit 0
